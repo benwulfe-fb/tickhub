@@ -616,18 +616,24 @@ Mode: HISTORICAL REPLAY
 
 ---
 
-## 5. Open Questions & Roadmap
+## 5. Architectural Decisions Locked In & Roadmap
 
+### 5.1 Approved Architectural Decisions
+1. **Precision Contract (`float64`)**:
+   - The Cadence feature matrix `[N_SYMBOLS, N_FEATURES]` in `/dev/shm` is strictly `float64` (8 bytes per metric).
+   - Guarantees bit-level parity with upstream quant pipelines and models in `/mnt/wc/src` without precision conversion penalties.
+2. **Static Universe Registration**:
+   - The symbol universe is fixed at daemon startup via `config.yaml` (`universe.symbols`).
+   - Pre-allocates deterministic memory strides and indices in shared memory. Intraday additions require restarting the daemon.
+3. **Parquet for Historical Replay**:
+   - Historical playback ingests standard Parquet tick files (quotes and trades) using pure Go (`github.com/parquet-go/parquet-go`).
+   - SPSC sequence gating ensures Python consumer steps deterministically through bars without dropping ticks or frames.
+
+### 5.2 Roadmap & Extensions
 1. **`tickhub-relay` Network Forwarder:**
-   - How should multi-node clusters consume TickHub?
-   - Candidate: A lightweight companion binary reading `/dev/shm` and broadcasting frames via raw UDP Multicast or kernel-bypass TCP (e.g. Solarflare OpenOnload).
-
+   - Multi-node fanout: lightweight daemon forwarding `/dev/shm` frames over UDP Multicast or kernel-bypass TCP.
 2. **GPU Direct Memory / CUDA IPC:**
-   - Can we map the shared memory buffer directly into GPU memory via CUDA Host Mapped Memory (`cudaHostRegister`) to eliminate host-to-device CPU transfer overheads?
-
-3. **Dynamic Universe Subscription:**
-   - Should TickHub support intraday universe updates, or is a fixed pre-allocated static universe strictly required to guarantee zero reallocations in shared memory?
-   - Recommendation for v1: Static universe defined in `config.yaml`. Intraday universe changes require restarting the daemon with a regenerated segment.
+   - Map `/dev/shm` directly into GPU memory via CUDA Host Mapped Memory (`cudaHostRegister`) for zero-copy CPU-to-GPU forward passes.
 
 ---
 
