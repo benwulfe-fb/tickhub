@@ -292,6 +292,10 @@ class TickHubReader:
         phase_idx = self._phase_name_to_idx[phase_name]
         offset_ms = self._phase_infos[phase_idx].offset_ms
         offset_ns = offset_ms * 1_000_000
+        if self.is_replay_mode:
+            last_written = self.last_written_anchor_ns
+            return ((last_written - offset_ns) // self.cadence_ns) * self.cadence_ns + offset_ns
+
         now_ns = time.time_ns()
         latency_ns = self.anchor_publish_latency_ns
 

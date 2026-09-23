@@ -66,6 +66,7 @@ func runReplay(args []string) {
 	datalakeDir := fs.String("datalake", "/mnt/wc/datalake", "Root datalake directory")
 	dateStr := fs.String("date", "2026-05-06", "Date partition (YYYY-MM-DD)")
 	maxTicks := fs.Int64("max-ticks", 0, "Stop after N ticks (0 = process all)")
+	noUnlink := fs.Bool("no-unlink", false, "Do not unlink SHM segment on exit (keep resident in /dev/shm)")
 	fs.Parse(args)
 
 	cfgData, err := os.ReadFile(*configPath)
@@ -137,7 +138,7 @@ func runReplay(args []string) {
 		Features:        rawCfg.Features,
 		Phases:          phaseConfigs,
 		Permissions:     0666,
-		UnlinkOnExit:    true,
+		UnlinkOnExit:    !*noUnlink,
 		Mode:            shm.ModeHistoricalReplay,
 	}
 

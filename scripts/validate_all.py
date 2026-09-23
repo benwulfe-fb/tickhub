@@ -93,7 +93,7 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, desc: str = "") -> None:
 
 def validate_c_build():
     """Verify C atomic library builds cleanly."""
-    telemetry.log("==================== [1/6] C Shared Library Compilation ====================")
+    telemetry.log("==================== [1/7] C Shared Library Compilation ====================")
     c_dir = ROOT / "c"
     run_cmd(["make", "-C", "c", "clean"], desc="Clean C shared library")
     run_cmd(["make", "-C", "c"], desc="Compile libtickhub_atomic.so")
@@ -107,7 +107,7 @@ def validate_c_build():
 
 def validate_abi_alignments():
     """Verify ABI struct sizes and cache line alignments in Python."""
-    telemetry.log("==================== [2/6] ABI Alignment & Size Verification ====================")
+    telemetry.log("==================== [2/7] ABI Alignment & Size Verification ====================")
     check_script = (
         "import sys, ctypes\n"
         "from tickhub.abi import GlobalHeader, SymbolSnapshot, FrameHeader, SymbolDirectoryEntry, PhaseInfo\n"
@@ -138,7 +138,7 @@ def validate_abi_alignments():
 
 def validate_go_builds():
     """Build all Go binaries."""
-    telemetry.log("==================== [3/6] Go Binary Compilation ====================")
+    telemetry.log("==================== [3/7] Go Binary Compilation ====================")
     bin_dir = ROOT / "bin"
     bin_dir.mkdir(exist_ok=True)
     run_cmd([GO_EXE, "build", "-o", "bin/tickhub", "./cmd/tickhub"], desc="Build tickhub CLI")
@@ -149,18 +149,18 @@ def validate_go_builds():
 
 def validate_go_tests():
     """Run Go tests with race detector."""
-    telemetry.log("==================== [4/6] Go Unit & Race Detector Suite ====================")
+    telemetry.log("==================== [4/7] Go Unit & Race Detector Suite ====================")
     run_cmd([GO_EXE, "test", "-v", "-race", "./..."], desc="Execute go test -race ./...")
     telemetry.log("Go unit and race tests passed cleanly.")
 
 
 def validate_python_tests():
-    """Run pytest suite."""
-    telemetry.log("==================== [5/6] Python Pytest Suite ====================")
+    """Run pytest suite excluding golden replay (which runs in stage 6)."""
+    telemetry.log("==================== [5/7] Python Pytest Suite ====================")
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT / "python") + ":" + env.get("PYTHONPATH", "")
     proc = subprocess.run(
-        [PYTHON_EXE, "-m", "pytest", "-v", "tests/"],
+        [PYTHON_EXE, "-m", "pytest", "-v", "--ignore=tests/test_golden_replay.py", "tests/"],
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -178,9 +178,33 @@ def validate_python_tests():
     telemetry.log("All Python integration tests passed cleanly.")
 
 
+def validate_golden_replay():
+    """Run golden replay bit-identical certification and performance regression gate."""
+    telemetry.log("==================== [6/7] Golden Replay & Performance Regression Gate ====================")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(ROOT / "python") + ":" + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [PYTHON_EXE, "-m", "pytest", "-v", "-s", "tests/test_golden_replay.py"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if proc.stdout:
+        for line in proc.stdout.strip().splitlines():
+            telemetry.log(f"    [golden] {line}")
+    if proc.stderr:
+        for line in proc.stderr.strip().splitlines():
+            telemetry.log(f"    [golden-err] {line}")
+    if proc.returncode != 0:
+        telemetry.error(f"Golden replay verification or performance gate failed with exit code {proc.returncode}")
+        sys.exit(1)
+    telemetry.log("Golden replay bit-identity and performance gates passed cleanly.")
+
+
 def validate_smoke_and_hygiene():
     """Run CLI smoke check and report git status."""
-    telemetry.log("==================== [6/6] Smoke Execution & Git Hygiene ====================")
+    telemetry.log("==================== [7/7] Smoke Execution & Git Hygiene ====================")
     # Check CLI help output
     proc = subprocess.run(
         [str(ROOT / "bin" / "tickhub"), "--help"],
@@ -214,6 +238,7 @@ def main():
         validate_go_builds()
         validate_go_tests()
         validate_python_tests()
+        validate_golden_replay()
         validate_smoke_and_hygiene()
 
         elapsed = (datetime.now() - start_time).total_seconds()
