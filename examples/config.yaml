@@ -1,0 +1,39 @@
+# TickHub SSoT Configuration
+shm:
+  name: "tickhub_demo"
+  max_frames: 256
+  cadence_interval: 1000000000  # 1 second in nanoseconds
+
+features:
+  - "log_ret_1s"
+  - "log_ret_5s"
+  - "log_ret_15s"
+  - "vol_1s"
+  - "spread_bps"
+
+unique_symbols:
+  - "SPY"
+  - "QQQ"
+  - "AAPL"
+  - "MSFT"
+  - "NVDA"
+  - "AMZN"
+
+phases:
+  - id: 0
+    name: "phase_0ms"
+    offset_ms: 0
+    symbols:
+      - "SPY"
+      - "QQQ"
+      - "AAPL"
+      - "MSFT"
+
+  - id: 1
+    name: "phase_500ms"
+    offset_ms: 500
+    symbols:
+      - "SPY"
+      - "QQQ"
+      - "NVDA"
+      - "AMZN"

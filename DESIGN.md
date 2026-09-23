@@ -1,8 +1,8 @@
 # TickHub System Architecture & Public API Design
 
-**Status:** Draft / Proposal  
+**Status:** Final Architectural Specification  
 **Author:** Staff Systems & Quantitative Infrastructure Engineer  
-**Scope:** Developer Ergonomics, Public API Contracts, Memory Layout (`/dev/shm`), and Synchronization Invariants  
+**Scope:** Developer Ergonomics, Public API Contracts, Memory Layout (`/dev/shm`), Synchronization Invariants, and Python Barrier Bridge  
 
 ---
 
@@ -10,7 +10,7 @@
 
 TickHub is a high-performance Go daemon designed to bridge high-frequency raw market data (live WebSocket feeds from Massive.com or historical tick files from Parquet/flat files) to Python-based quantitative research and trading pipelines. 
 
-TickHub projects irregular, high-rate tick streams into structured, fixed-cadence metric snapshots (e.g., 1 Hz NBBO, VWAP, trade volume, order flow imbalances) and writes them directly into POSIX shared memory (`/dev/shm`). Downstream consumers (e.g., PyTorch deep learning models scoring multi-symbol universes) read contiguous memory blocks with zero runtime IPC, zero serialization overhead, and zero copy (`torch.from_numpy`).
+TickHub projects irregular, high-rate tick streams into structured, fixed-cadence metric snapshots (e.g., 1 Hz NBBO, VWAP, trade volume, order flow imbalances) and writes them directly into POSIX shared memory (`/dev/shm`). Downstream consumers (such as PyTorch deep learning models scoring multi-symbol universes in 500 ms phases) read contiguous memory blocks with zero runtime IPC, zero serialization overhead, zero copy (`torch.from_numpy`), and zero process synchronization primitives (no futex, no mutex, no eventfd).
 
 ### Architectural Block Diagram
 
@@ -25,7 +25,7 @@ TickHub projects irregular, high-rate tick streams into structured, fixed-cadenc
                                        v
                      +-----------------------------------+
                      |          TickHub Daemon           |
-                     |           (`tickhub run`)         |
+                     |     (`tickhub run --config ...`)  |
                      |                                   |
                      |  +-----------------------------+  |
                      |  | Ingestion Arena & Demux     |  |
@@ -35,86 +35,170 @@ TickHub projects irregular, high-rate tick streams into structured, fixed-cadenc
                      |                 v                 |
                      |  +-----------------------------+  |
                      |  | Cadence Projection Engine   |  |
-                     |  | (1 Hz Static Metric Blocks) |  |
+                     |  | - project1hz kernel (Go)    |  |
+                     |  | - Dynamic Watermark Buffer  |  |
+                     |  | - Published Latency Monitor |  |
                      |  +--------------+--------------+  |
                      +-----------------+-----------------+
                                        |
-                                       v  POSIX Shared Memory (`mmap`)
+                                       v  POSIX Shared Memory (`/dev/shm/tickhub_<name>`)
     =============================================================================
-    POSIX Shared Memory: `/dev/shm/tickhub_<name>`
+    POSIX Shared Memory Layout (64-Byte Cache-Line Aligned)
     -----------------------------------------------------------------------------
-    [Global Header]          Magic, status, symbols, features, ring geometry
-                             Cache-line isolated `last_written` / `last_read`
+    [Global Header]          Magic, status, num_phases, published latency
+                             `anchor_publish_latency_ns` (atomic)
+                             `watermark_buffer_ns` (atomic)
     -----------------------------------------------------------------------------
-    [Symbol Directory]       Fixed-stride symbol names & index mapping (0..N-1)
+    [Symbol Directory]       Fixed-stride symbol names & index mapping
     -----------------------------------------------------------------------------
-    [Latest Snapshot Table]  Top-of-book per symbol (NBBO, last trade, spread)
+    [Latest Snapshot Table]  Top-of-book per UNIQUE symbol (NBBO, last trade)
                              SeqLock-protected, sub-microsecond access
     -----------------------------------------------------------------------------
-    [Cadence Ring Buffer]    Contiguous multi-symbol frames: [max_frames][N][D]
-                             Directly zero-copy consumable by NumPy / PyTorch
+    [Phase 0 Ring Buffer]    Cadence: 1.0s, Offset: 0 ms
+                             Contiguous [max_frames][N_phase0][D] float64
+                             Dedicated SPY / QQQ slots for Phase 0
+    -----------------------------------------------------------------------------
+    [Phase 1 Ring Buffer]    Cadence: 1.0s, Offset: 500 ms
+                             Contiguous [max_frames][N_phase1][D] float64
+                             Dedicated SPY / QQQ slots re-projected for Phase 1
     =============================================================================
                                        |
-                                       v  Direct Pointer / `torch.from_numpy`
+                                       v  Async Load (yields to event loop) + Sweep
                      +-----------------------------------+
                      |   Python Quant / ML Consumer      |
-                     |   (Single-Process Batch Inference)|
+                     |   (Single-Process Async Engine)   |
                      |                                   |
                      |  +-----------------------------+  |
                      |  | `TickHubReader` Client      |  |
+                     |  | - `begin_all()` cursors     |  |
+                     |  | - `await hub.load(cursors)` |  |
+                     |  | - C-Level Memory Barrier    |  |
+                     |  |   (`libtickhub_atomic.so`)  |  |
                      |  +--------------+--------------+  |
                      |                 |                 |
                      |                 v                 |
                      |  +-----------------------------+  |
                      |  | PyTorch Tensor Batch        |  |
                      |  | `torch.from_numpy(features)`|  |
-                     |  | Shape: [N_SYMBOLS, D_FEATS] |  |
+                     |  | Shape: [N_phase, D] float64 |  |
                      |  +-----------------------------+  |
                      +-----------------------------------+
 ```
 
 ---
 
-## 2. Public Developer Usage (End-to-End Walkthrough)
+## 2. Temporal Semantics: Watermark Buffer, Load-Bearing Anchors, & Staleness
 
-### 2.1 CLI Daemon Execution
+### 2.1 The Dynamic Watermark Buffer ($\Delta t$)
 
-The daemon lifecycle is managed via standard CLI invocation, configuration files, and standard POSIX process signals (`SIGINT`, `SIGTERM`).
-
-```bash
-# Validate configuration and calculate shared memory footprint
-tickhub validate --config config.yaml
-
-# Run daemon in foreground (systemd / container entrypoint)
-tickhub run --config config.yaml
-
-# Optional flag overrides
-tickhub run --config config.yaml --mode replay --verbose
-```
-
-#### Process Lifecycle & Signals
-- **Startup:** Allocates or re-attaches `/dev/shm/tickhub_<name>`. Formats global header, zeroes ring buffer structures, and transitions status from `BOOTING` to `RUNNING`.
-- **`SIGINT` / `SIGTERM`:** Enters graceful drain: sets header status to `HALTING`, finishes current cadence interval commit, and exits cleanly. In replay mode, the SHM segment persists for post-run analysis unless `--unlink-on-exit` is passed.
-- **`SIGHUP`:** Re-reads logging levels and metrics configuration flags (symbol universe reconfigurations require restart).
+The watermark is **not** an incoming tick counter that waits for quiet names. It is a **time buffer ($\Delta t$) added to the anchor timestamp $T$**:
+- The 1-second cadence window $[T - 1\text{s}, T)$ closes unconditionally when:
+  $$\text{wall\_clock\_time} \ge T + \Delta t$$
+- All ticks arriving before $T + \Delta t$ whose SIP timestamp falls in $[T - 1\text{s}, T)$ are aggregated into bar $T$.
+- Any tick arriving *after* $T + \Delta t$ with SIP timestamp $< T$ is recorded as a late/dropped tick.
+- **Dynamic Inclusion Calibration**:
+  TickHub continuously monitors late-tick drop rates. It dynamically adjusts $\Delta t$ within bounds (`min_buffer_ms` to `max_buffer_ms`) to target configured data completeness thresholds (e.g. 95%, 99%, or 99.9%).
+- **Quiet Symbols**:
+  Quiet symbols never delay window closure. When $T + \Delta t$ expires, quiet symbols are closed immediately: prices are forward-filled, volume/notionals are zero-filled, and their `symbol_anchor_ns[i]` is committed to $T$.
 
 ---
 
-### 2.2 Configuration Schema (`config.yaml`)
+### 2.2 Load-Bearing `anchor_ns` Sequence Number
+
+To prevent race conditions, sequence desynchronization, or stale frame consumption:
+- **`anchor_ns` is the foundational sequence identifier.**
+- No synthetic sequence integers (`0, 1, 2...`). Every frame slot in the ring buffer is indexed and verified by its exact epoch nanosecond anchor:
+  $$\text{slot\_index} = \left(\frac{\text{anchor\_ns}}{\text{cadence\_interval\_ns}}\right) \ \& \ (\text{max\_frames} - 1)$$
+- Every frame carries:
+  - `frame.anchor_ns`: Global anchor for the frame.
+  - `frame.symbol_anchor_ns[i]`: Per-symbol commit anchor timestamp.
+- **Invariant**: The consumer verifies `frame.anchor_ns == target_anchor_ns`. Cross-anchor reading is structurally impossible.
+
+---
+
+### 2.3 Staleness Metric & Fast-Drain Catch-Up
+
+When client scoring pauses or takes longer than 1 cadence interval:
+- Data is **not lost**; it is preserved in `/dev/shm` (retaining $\sim 17$ minutes across 1,024 frames).
+- Recurrent neural networks, causal Transformers, and EMA filters **cannot skip bars**. Dropping intermediate bars creates holes and corrupts model state.
+
+#### Definition of `cursor.staleness_ns`:
+$$\text{expected\_publish\_wall\_ns} = \text{cursor.target\_anchor\_ns} + \text{hub.anchor\_publish\_latency\_ns}$$
+$$\text{staleness\_ns} = \text{wall\_clock\_now\_ns} - \text{expected\_publish\_wall\_ns}$$
+
+- $\text{staleness\_ns} < \text{cadence\_ns}$: Client is at real-time tip.
+- $\text{staleness\_ns} \ge \text{cadence\_ns}$: **Client is $\ge 1$ step behind tip.** Data is already waiting in `/dev/shm`.
+
+#### Fast-Drain Protocol:
+When `cursor.is_stale` is True, `await hub.load(cursors, ...)` skips sleep and reads immediately at CPU speed (< 5 µs per bar). The client loops until `not any(c.is_stale for c in cursors)`, catching up in microseconds with zero holes in data.
+
+---
+
+### 2.4 Multi-Phase Cross-Asset Symbols (SPY, QQQ)
+
+Symbols present in multiple phases (e.g. SPY, QQQ) are projected over distinct temporal windows:
+- Phase 0: $[T - 1\text{s}, T)$
+- Phase 1: $[T - 0.5\text{s}, T + 0.5\text{s})$
+
+**SHM Solution**: Dedicated per-phase cadence ring buffers.
+- SPY in Phase 0 sits in Phase 0's contiguous matrix `[N_phase0, D]`.
+- SPY in Phase 1 sits in Phase 1's contiguous matrix `[N_phase1, D]`.
+- Prevents cross-phase memory overwrite collisions while keeping each phase's PyTorch batch tensor 100% contiguous.
+
+---
+
+## 3. Python Hardware Memory Barrier Bridge (`libtickhub_atomic.so`)
+
+CPython interpreter and standard `ctypes` do not emit CPU memory barrier instructions. To guarantee zero torn reads and strict load-acquire semantics without heavy external dependencies, TickHub ships a minimal C library compiled via GCC:
+
+```c
+#include <stdatomic.h>
+#include <stdint.h>
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
+int64_t tickhub_atomic_load_acquire_i64(const int64_t* addr) {
+    return atomic_load_explicit((const _Atomic int64_t*)addr, memory_order_acquire);
+}
+
+void tickhub_atomic_thread_fence_acquire(void) {
+    atomic_thread_fence(memory_order_acquire);
+}
+
+void tickhub_cpu_pause(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("isb" ::: "memory");
+#else
+    atomic_thread_fence(memory_order_seq_cst);
+#endif
+}
+```
+
+Loaded via `ctypes.CDLL` in Python `tickhub.shm`. Guarantees hardware-level load-acquire barriers and compiler fence prevention.
+
+---
+
+## 4. Public Developer Usage & API Specifications
+
+### 4.1 Single Source of Truth Configuration (`config.yaml`)
+
+Both the Go daemon (`tickhub run`) and the Python client (`TickHubReader`) consume the same declarative YAML:
 
 ```yaml
 version: 1
 
-# Shared memory segment settings
 shm:
-  name: "prod_1hz"             # Results in /dev/shm/tickhub_prod_1hz
-  max_frames: 1024             # Power of 2 required for fast bitmask indexing
-  permissions: 0660            # POSIX octal file permissions
-  unlink_on_exit: false        # If true, daemon deletes /dev/shm file on SIGTERM
+  name: "prod_1hz"             # /dev/shm/tickhub_prod_1hz
+  max_frames: 1024             # Power of 2 required
+  permissions: 0660
+  unlink_on_exit: false
 
-# Operational mode: live | replay
-mode: live
+mode: live                     # live | replay
 
-# Upstream data sources
 source:
   live:
     provider: "massive"
@@ -122,519 +206,262 @@ source:
     api_key_env: "MASSIVE_API_KEY"
     reconnect_backoff_ms: 1000
     max_reconnect_backoff_ms: 30000
-    queue_capacity: 200000     # Internal frame demux queue
+    queue_capacity: 200000
   replay:
     data_dir: "/mnt/wc/datalake/parquet"
     start_time: "2026-09-01T09:30:00.000Z"
     end_time: "2026-09-01T16:00:00.000Z"
-    playback_speed: 0.0        # 0.0 = as fast as consumer steps (gated)
+    playback_speed: 0.0
 
-# Static Symbol Universe (Order defines row index 0..N-1 in batch tensor)
-universe:
-  symbols:
-    - SPY
-    - QQQ
-    - AAPL
-    - MSFT
-    - NVDA
-    - AMZN
-    - GOOGL
-    - META
-    - TSLA
-    - AMD
-    # ... up to 32, 64, or 128 configured symbols
-
-# Projection Cadence & Temporal Grid
 cadence:
-  interval_ms: 1000            # 1000 ms = 1 Hz projection
-  anchor_offset_ns: 0          # Alignment offset from wallclock second boundary
-  window_s: 1                  # Aggregation window span per frame
+  interval_ms: 1000
+  watermark:
+    initial_buffer_ms: 50
+    target_inclusion_pct: 99.0
+    min_buffer_ms: 10
+    max_buffer_ms: 250
+  phases:
+    - id: 0
+      name: "phase_0ms"
+      offset_ms: 0
+      symbols:
+        - SPY
+        - QQQ
+        - AAPL
+        - NVDA
+    - id: 1
+      name: "phase_500ms"
+      offset_ms: 500
+      symbols:
+        - SPY
+        - QQQ
+        - MSFT
+        - AMZN
 
-# Metric Selection (Statically compiled features toggled via mask)
 metrics:
-  core: true                   # last_bid_px, last_ask_px, last_trade_px, midprice, spread
-  trade_flow: true             # buy_volume, sell_volume, buy_notional, sell_notional, trade_counts
-  quote_flow: true             # bid_quote_count, ask_quote_count, high/low bid/ask
-  microstructure: true         # nbbo_quote_rate, nbbo_staleness_ms, dark_trade_primitive
-  variance: false              # trade_vol_std_px, trade_vol_skew (optional higher compute)
-
-# Synchronization & Flow Control
-execution:
-  replay_gated: true           # In replay: block producer if ring buffer full
-  overrun_policy: "overwrite"  # In live: "overwrite" advances write, signals lag to reader
-  spin_yield: true             # Reader/writer spin strategy (PAUSE vs sched_yield)
+  core: true
+  trade_flow: true
+  quote_flow: true
+  microstructure: true
+  variance: false
 ```
 
 ---
 
-### 2.3 Python Consumer API & Usage Walkthrough
+### 4.2 CLI Daemon Management (Go)
 
-The client is a standalone, dependency-minimal Python package (`pip install tickhub` or single-file module) utilizing Python's built-in `mmap`, `ctypes`, and `numpy`. Zero sockets, zero gRPC, and zero deserialization overhead.
+The Go daemon is managed entirely via the CLI (no public Go library):
 
-#### Complete End-to-End Consumer Pattern
+```bash
+# Validate config and print calculated memory layout
+tickhub validate --config config.yaml
+
+# Run daemon in foreground
+tickhub run --config config.yaml
+
+# Inspect live SHM state in console
+tickhub inspect --config config.yaml
+```
+
+---
+
+### 4.3 Python Public API (`tickhub` package)
 
 ```python
-import time
-import torch
-import numpy as np
-from tickhub import TickHubReader
+class TickHubReader:
+    def __init__(self, config_path: str | Path, *, lock_memory: bool = False):
+        """Attaches to /dev/shm using config.yaml as SSoT."""
 
-def run_inference_loop():
-    # 1. Attach to shared memory (read-only mapping)
-    # Reads /dev/shm/tickhub_prod_1hz without copying
-    with TickHubReader(shm_name="prod_1hz", mode="live") as hub:
-        print(f"Connected to TickHub SHM segment: {hub.shm_name}")
-        print(f"Universe: {hub.num_symbols} symbols: {hub.symbols}")
-        print(f"Features: {hub.num_features} columns: {hub.feature_names}")
+    # --- SSoT Metadata ---
+    @property
+    def phases(self) -> list[str]:
+        """Names of configured phases (e.g. ['phase_0ms', 'phase_500ms'])."""
 
-        # Pre-allocate reusable local buffers for zero-allocation access
-        snapshot_buf = hub.new_snapshot_buffer()
+    def symbols_for_phase(self, phase: str) -> list[str]:
+        """List of symbols assigned to phase in config."""
+
+    @property
+    def features(self) -> list[str]:
+        """Ordered list of projected feature names."""
+
+    @property
+    def num_features(self) -> int:
+        """Total feature dimension D."""
+
+    @property
+    def cadence_interval_ns(self) -> int:
+        """Cadence duration in nanoseconds (e.g. 1_000_000_000 for 1Hz)."""
+
+    def is_running(self) -> bool:
+        """Checks daemon liveness and heartbeat."""
+
+    # --- Sync Initialization & Setup ---
+    def begin_all(
+        self,
+        *,
+        history_steps: int = 0,
+        out_history: Optional[np.ndarray] = None
+    ) -> tuple[list["SymbolCursor"], int]:
+        """Initializes cursors for ALL symbols across ALL phases declared in config.
+        Returns a plain Python list[SymbolCursor] and number of history steps loaded.
+        """
+
+    def next(self, cursors: Sequence["SymbolCursor"]) -> None:
+        """Synchronously advances target anchor by cadence interval (+1s) on all cursors."""
+
+    def snapshot(
+        self,
+        symbol: str,
+        out_buf: Optional[SymbolSnapshot] = None
+    ) -> Optional[SymbolSnapshot]:
+        """Synchronous sub-microsecond top-of-book read via SeqLock."""
+
+    # --- ASYNC Data Loading ---
+    async def load(
+        self,
+        cursors: Sequence["SymbolCursor"],
+        out_matrix: np.ndarray,
+        *,
+        timeout_ms: float = 100.0
+    ) -> list["SymbolCursor"]:
+        """Asynchronous: Yields to asyncio event loop during network wait, then sweeps.
         
-        # 2. Instant Top-Of-Book Query (SeqLock, Zero Wait)
-        ok = hub.snapshot("AAPL", snapshot_buf)
-        if ok:
-            print(f"AAPL Top of Book: Bid={snapshot_buf.bid_px:.2f} "
-                  f"Ask={snapshot_buf.ask_px:.2f} "
-                  f"Mid={snapshot_buf.midprice:.2f} "
-                  f"SIP_NS={snapshot_buf.sip_timestamp_ns}")
+        - If cursors are at tip: executes `await asyncio.sleep(wait_time)`, freeing
+          the event loop for concurrent broker WebSocket I/O and order handling.
+        - If any cursor is stale: skips sleep and fast-drains immediately at CPU speed.
+        - Returns list of SymbolCursor instances that timed out.
+        """
 
-        # 3. Main Model Scoring Loop (Windowed Cadence Frames)
-        # In live mode: hub.read_latest() gives most recent completed 1Hz frame
-        # In replay mode: hub.read_next() steps sequentially through 1Hz frames
+    def load_sync(
+        self,
+        cursors: Sequence["SymbolCursor"],
+        out_matrix: np.ndarray,
+        *,
+        timeout_ms: float = 100.0
+    ) -> list["SymbolCursor"]:
+        """Synchronous fallback for scripts not running an asyncio event loop."""
+
+
+class SymbolCursor:
+    symbol: str
+    phase: str
+    target_anchor_ns: int
+
+    @property
+    def staleness_ns(self) -> int:
+        """(now_utc - (target_anchor + publish_latency)). Delta behind tip in ns."""
+
+    @property
+    def staleness_ms(self) -> float:
+        """Staleness in milliseconds."""
+
+    @property
+    def is_stale(self) -> bool:
+        """True if target_anchor is >= 1 cadence step behind live tip."""
+
+    def next(self) -> int:
+        """Advances target anchor (+1s). Raises LaggedAnchorError if overwritten."""
+
+    def rebegin(
+        self,
+        *,
+        history_steps: int = 0,
+        out_history: Optional[np.ndarray] = None
+    ) -> int:
+        """Recovery helper: re-anchors to newest phase-aligned anchor and reloads history."""
+```
+
+---
+
+### 4.4 End-to-End Client Usage Example (Async Python Engine)
+
+```python
+import asyncio
+import numpy as np
+import torch
+from tickhub import TickHubReader, LaggedAnchorError
+
+async def run_trading_engine():
+    # Sync attach to /dev/shm via config.yaml
+    with TickHubReader("config.yaml", lock_memory=True) as hub:
+        history_steps = 180
+
+        # 1. Sync setup: initialize all cursors in one shot -> plain Python list
+        all_cursors, loaded = hub.begin_all(history_steps=history_steps)
+        print(f"TickHub ready: {len(all_cursors)} cursors ({loaded} history steps).")
+
+        # 2. Partition cursors per phase using native list comprehensions
+        phases = [
+            (p, [c for c in all_cursors if c.phase == p])
+            for p in hub.phases
+        ]
+
+        # 3. Pre-allocate batch buffers & zero-copy PyTorch tensors
+        phase_data = []
+        for p, cursors in phases:
+            buf = np.empty((len(cursors), hub.num_features), dtype=np.float64)
+            tensor = torch.from_numpy(buf)
+            phase_data.append((p, cursors, buf, tensor))
+
+        snap = hub.snapshot("AAPL")
+
+        # 4. Main Multi-Phase Stepping Loop
         while hub.is_running():
-            # Zero-copy view into SHM ring buffer frame
-            # frame.features is a 2D numpy array [N_SYMBOLS, N_FEATURES]
-            # memory is borrowed directly from /dev/shm
-            frame = hub.read_next(timeout_ms=2000)
-            if frame is None:
-                continue
+            for phase_name, cursors, batch_matrix, batch_tensor in phase_data:
+                try:
+                    # --- Step A: Fast-drain any individually lagging cursors ---
+                    # When stale, await hub.load() does not sleep; runs at CPU speed
+                    while stale := [c for c in cursors if c.is_stale]:
+                        stale_buf = np.empty((len(stale), hub.num_features), dtype=np.float64)
+                        await hub.load(stale, stale_buf, timeout_ms=10.0)
+                        hub.next(stale)
 
-            # 4. Zero-Copy PyTorch Tensor Conversion
-            # torch.from_numpy shares the underlying memory buffer!
-            # Shape: [32, 24], dtype: torch.float64 (or float32)
-            tensor_batch = torch.from_numpy(frame.features)
+                    # --- Step B: Async Real-Time Load at Tip ---
+                    # Yields to event loop during the ~40ms network transit window!
+                    # Broker order fills, socket frames, and cancels process concurrently.
+                    failed = await hub.load(cursors, batch_matrix, timeout_ms=100.0)
+                    if failed:
+                        print(f"Warning: {len(failed)} symbols timed out in {phase_name}: {[c.symbol for c in failed]}")
 
-            # Move to device / run forward pass
-            # (or pin_memory -> async CUDA transfer)
-            with torch.no_grad():
-                # predictions = model(tensor_batch)
-                pass
+                    # --- Step C: Synchronous Model Scoring ---
+                    scores = model(batch_tensor)
 
-            # 5. Acknowledge frame consumption (advances last_read)
-            # In replay mode, this unblocks the Go daemon to produce frame N+max_frames
-            hub.advance_read(frame.sequence)
+                    # --- Step D: Synchronous Cursor Advance ---
+                    hub.next(cursors)
+
+                    # Instant synchronous top-of-book check
+                    hub.snapshot("AAPL", snap)
+
+                except LaggedAnchorError as e:
+                    print(f"Lag detected: {e}. Re-anchoring phase {phase_name}...")
+                    for c in cursors:
+                        c.rebegin(history_steps=history_steps)
 
 if __name__ == "__main__":
-    run_inference_loop()
+    asyncio.run(run_trading_engine())
 ```
 
 ---
 
-## 3. Shared Memory Layout & Binary ABI Contract
+## 5. Phase 1 Implementation Plan: The Standalone SHM Subsystem
 
-All structures are laid out with strict byte offsets, natural alignment, and 64-byte cache-line isolation to prevent cross-core false sharing between the Go daemon (writer) and Python process (reader).
-
-### 3.1 Memory Segment Map
+Phase 1 strictly establishes the Shared Memory Subsystem as a standalone, tested architectural layer before any feed ingestion or projection logic is written:
 
 ```
-Offset (Hex)      Offset (Dec)      Section Name              Size
---------------------------------------------------------------------------------
-0x00000000        0 B               GlobalHeader              1,024 B (1 KB)
-0x00000400        1,024 B           SymbolDirectory           3,072 B (3 KB)
-0x00001000        4,096 B           LatestSnapshotTable       16,384 B (16 KB)
-0x00005000        20,480 B          Reserved / Page Pad       45,056 B (44 KB)
-0x00010000        65,536 B          CadenceRingBuffer         Variable (Page Aligned)
-                                    [max_frames * FrameBytes]
+Step 1: Go Memory Layer (pkg/shm)
+├── layout.go         -> Struct sizes (1024B header, 128B snapshot, 64B frame), 64B cache line isolation, compile assertions
+├── segment.go        -> POSIX shm_open, ftruncate, mmap, munmap, shm_unlink
+└── producer.go       -> API to format SHM, write snapshots via SeqLock, commit frames & symbol anchors, publish latency
+
+Step 2: C Atomic Bridge (c/tickhub_atomic.c)
+├── tickhub_atomic.c  -> tickhub_atomic_load_acquire_i64, tickhub_atomic_thread_fence_acquire, tickhub_cpu_pause
+└── Makefile          -> gcc -O3 -shared -fPIC to build libtickhub_atomic.so
+
+Step 3: Python Client Layer (python/tickhub)
+├── abi.py            -> ctypes mirror of Go structs with exact byte sizes and offsets
+└── shm.py            -> TickHubReader: async load(), begin_all(), snapshot(), next(), SymbolCursor
+
+Step 4: Cross-Language Verification & Latency Benchmarks (tests/)
+├── test_shm_cross.py -> Go producer writes deterministic pattern; Python verifies bit-exact data across all symbols
+└── benchmark_shm.py  -> Measures Linux time.sleep() jitter distribution and sweep loop microsecond overhead
 ```
-
----
-
-### 3.2 Global Header Specification
-
-The global header resides at offset `0x00000000`. Critical producer and consumer sequence counters reside on isolated 64-byte cache lines.
-
-```
-Byte Offset   Type      Field Name          Description
---------------------------------------------------------------------------------
-0x0000        uint64    magic               Magic number: 0x5449434B48554231 ("TICKHUB1")
-0x0008        uint32    version             ABI schema version: 1
-0x000C        uint32    status              0=UNINIT, 1=BOOTING, 2=RUNNING, 3=HALTING, 4=CLOSED
-0x0010        uint32    mode                0=LIVE_STREAMING, 1=HISTORICAL_REPLAY
-0x0014        uint32    num_symbols         N symbols in universe (e.g. 32)
-0x0018        uint32    num_features        D metrics projected per symbol (e.g. 24)
-0x001C        uint32    max_frames          Ring capacity (must be power of 2, e.g. 1024)
-0x0020        uint64    frame_stride_bytes  Byte size of each CadenceFrame
-0x0028        uint64    cadence_interval_ns Interval in nanoseconds (1s = 1,000,000,000)
-0x0030        int64     daemon_pid          PID of the Go daemon process
-0x0038        int64     heartbeat_ns        Monotonic wall clock ns updated by daemon
---------------------------------------------------------------------------------
-0x0040..0x007F (64B)    PRODUCER CACHE LINE (Writer Only)
-0x0040        int64     last_written_seq    Monotonically increasing committed frame seq
-0x0048        uint64    total_ticks_ingest  Cumulative ticks processed by daemon
-0x0050        uint64    overrun_count       Number of times writer overwrote unread frame
-0x0058..0x007F [40]byte _pad_producer       Padding to end of 64-byte line
---------------------------------------------------------------------------------
-0x0080..0x00BF (64B)    CONSUMER CACHE LINE (Reader Only)
-0x0080        int64     last_read_seq       Monotonically increasing consumed frame seq
-0x0088        int64     consumer_pid        PID of the Python consumer process
-0x0090        int64     consumer_heartbeat  Heartbeat ns updated by Python reader
-0x0098..0x00BF [40]byte _pad_consumer       Padding to end of 64-byte line
---------------------------------------------------------------------------------
-0x00C0..0x03FF [832]byte _reserved          Reserved for future telemetry/extensions
-```
-
----
-
-### 3.3 Symbol Directory Specification
-
-Resides at offset `0x00000400`. Maps dense symbol index `[0..N-1]` to ASCII symbol names.
-
-- Fixed stride: 16 bytes per symbol entry.
-- Max symbols supported in fixed directory: 192 (192 × 16 = 3,072 bytes).
-- Each entry:
-  - `symbol_name`: 8-byte null-padded ASCII string (e.g., `"SPY\0\0\0\0\0"`).
-  - `lot_size`: uint32 (default 100 for equities).
-  - `symbol_index`: uint16 (0, 1, ... N-1).
-  - `flags`: uint16.
-
----
-
-### 3.4 Latest Snapshot Table Specification (Top of Book)
-
-Resides at offset `0x00001000`. An array of `SymbolSnapshot` entries indexed by `symbol_index`.
-Each entry is exactly **128 bytes** (two 64-byte cache lines), containing a dedicated **SeqLock** sequence counter.
-
-```
-Byte Offset   Type      Field Name          Description
---------------------------------------------------------------------------------
-0x0000        uint64    seqlock_seq         SeqLock sequence: odd=writing, even=stable
-0x0008        int64     sip_timestamp_ns    SIP exchange timestamp (nanoseconds)
-0x0010        int64     recv_timestamp_ns   Local arrival timestamp at daemon (ns)
-0x0018        float64   bid_px              National Best Bid Price
-0x0020        float64   ask_px              National Best Ask Price
-0x0028        float64   bid_sz              National Best Bid Size (shares or lots)
-0x0030        float64   ask_sz              National Best Ask Size (shares or lots)
-0x0038        float64   last_trade_px       Last executed trade price
-0x0040        float64   last_trade_sz       Last executed trade size
-0x0048        float64   midprice            (bid_px + ask_px) / 2.0
-0x0050        float64   spread              ask_px - bid_px
-0x0058        uint32    bid_exch            Exchange ID for bid
-0x005C        uint32    ask_exch            Exchange ID for ask
-0x0060        uint32    trade_exch          Exchange ID for last trade
-0x0064        uint32    conditions          Condition flags / TRF flags
-0x0068..0x007F [24]byte _pad_snapshot       Padded to exact 128-byte boundary
-```
-
----
-
-### 3.5 Cadence Ring Buffer & Frame Specification
-
-Resides at offset `0x00010000` (64 KB, page-aligned). Contains `max_frames` contiguous slots.
-
-#### Structure of a Single `CadenceFrame`:
-```
-[FrameHeader: 64 Bytes]
-    - sequence: int64
-    - start_timestamp_ns: int64
-    - end_timestamp_ns: int64
-    - num_symbols: uint32
-    - num_features: uint32
-    - flags: uint32 (e.g. 0x01 = partial_window, 0x02 = dropped_ticks)
-    - _pad: [32]byte
-[Feature Matrix: N_SYMBOLS * N_FEATURES * 8 Bytes]
-    - Contiguous Row-Major 2D array of float64
-    - Row i corresponds to symbol i from SymbolDirectory
-    - Column j corresponds to feature j
-```
-
-#### Tensor Memory Layout:
-For $N = 32$ symbols and $D = 24$ features:
-- Feature payload per frame = $32 \times 24 \times 8 = 6,144$ bytes.
-- Total frame stride = $64 \text{ (header)} + 6,144 \text{ (matrix)} = 6,208$ bytes.
-- Total ring buffer size for 1,024 frames = $1,024 \times 6,208 \approx 6.06 \text{ MB}$.
-- Directly mapped into PyTorch:
-  ```python
-  # Shape: (32, 24), Strides: (192, 8)
-  frame_tensor = torch.from_numpy(np.ndarray(
-      shape=(num_symbols, num_features),
-      dtype=np.float64,
-      buffer=shm_buf,
-      offset=frame_offset + 64
-  ))
-  ```
-
----
-
-### 3.6 Binary ABI Implementations (Go & Python)
-
-#### Go Struct Definitions (`internal/shm/layout.go`):
-```go
-package shm
-
-import "unsafe"
-
-const (
-	MagicBytes        = 0x5449434B48554231 // "TICKHUB1"
-	HeaderOffset      = 0x00000000
-	DirectoryOffset   = 0x00000400
-	SnapshotOffset    = 0x00001000
-	RingBufferOffset  = 0x00010000
-)
-
-type GlobalHeader struct {
-	Magic            uint64
-	Version          uint32
-	Status           uint32
-	Mode             uint32
-	NumSymbols       uint32
-	NumFeatures      uint32
-	MaxFrames        uint32
-	FrameStrideBytes uint64
-	CadenceInterval  uint64
-	DaemonPID        int64
-	HeartbeatNS      int64
-
-	// Producer Cache Line (Aligned to 64 bytes)
-	_pad0            [16]byte
-	LastWrittenSeq   int64
-	TotalTicksIngest uint64
-	OverrunCount     uint64
-	_padProducer     [40]byte
-
-	// Consumer Cache Line (Aligned to 64 bytes)
-	LastReadSeq      int64
-	ConsumerPID      int64
-	ConsumerHeartbeat int64
-	_padConsumer     [40]byte
-
-	_reserved        [832]byte
-}
-
-type SymbolSnapshot struct {
-	SeqLockSeq       uint64
-	SIPTimestampNS   int64
-	RecvTimestampNS  int64
-	BidPx            float64
-	AskPx            float64
-	BidSz            float64
-	AskSz            float64
-	LastTradePx      float64
-	LastTradeSz      float64
-	Midprice         float64
-	Spread           float64
-	BidExch          uint32
-	AskExch          uint32
-	TradeExch        uint32
-	Conditions       uint32
-	_pad             [24]byte
-}
-
-type FrameHeader struct {
-	Sequence         int64
-	StartTimestampNS int64
-	EndTimestampNS   int64
-	NumSymbols       uint32
-	NumFeatures      uint32
-	Flags            uint32
-	_pad             [36]byte
-}
-
-// Compile-time struct size verifications
-const (
-	_ = 1 / (1 - (unsafe.Sizeof(GlobalHeader{}) == 1024))
-	_ = 1 / (1 - (unsafe.Sizeof(SymbolSnapshot{}) == 128))
-	_ = 1 / (1 - (unsafe.Sizeof(FrameHeader{}) == 64))
-)
-```
-
-#### Python NumPy / Ctypes Layout (`tickhub/abi.py`):
-```python
-import ctypes
-import numpy as np
-
-class GlobalHeaderStruct(ctypes.Structure):
-    _pack_ = 8
-    _fields_ = [
-        ("magic", ctypes.c_uint64),
-        ("version", ctypes.c_uint32),
-        ("status", ctypes.c_uint32),
-        ("mode", ctypes.c_uint32),
-        ("num_symbols", ctypes.c_uint32),
-        ("num_features", ctypes.c_uint32),
-        ("max_frames", ctypes.c_uint32),
-        ("frame_stride_bytes", ctypes.c_uint64),
-        ("cadence_interval_ns", ctypes.c_uint64),
-        ("daemon_pid", ctypes.c_int64),
-        ("heartbeat_ns", ctypes.c_int64),
-        ("_pad0", ctypes.c_uint8 * 16),
-        ("last_written_seq", ctypes.c_int64),
-        ("total_ticks_ingest", ctypes.c_uint64),
-        ("overrun_count", ctypes.c_uint64),
-        ("_pad_producer", ctypes.c_uint8 * 40),
-        ("last_read_seq", ctypes.c_int64),
-        ("consumer_pid", ctypes.c_int64),
-        ("consumer_heartbeat", ctypes.c_int64),
-        ("_pad_consumer", ctypes.c_uint8 * 40),
-        ("_reserved", ctypes.c_uint8 * 832),
-    ]
-
-class SymbolSnapshotStruct(ctypes.Structure):
-    _pack_ = 8
-    _fields_ = [
-        ("seqlock_seq", ctypes.c_uint64),
-        ("sip_timestamp_ns", ctypes.c_int64),
-        ("recv_timestamp_ns", ctypes.c_int64),
-        ("bid_px", ctypes.c_double),
-        ("ask_px", ctypes.c_double),
-        ("bid_sz", ctypes.c_double),
-        ("ask_sz", ctypes.c_double),
-        ("last_trade_px", ctypes.c_double),
-        ("last_trade_sz", ctypes.c_double),
-        ("midprice", ctypes.c_double),
-        ("spread", ctypes.c_double),
-        ("bid_exch", ctypes.c_uint32),
-        ("ask_exch", ctypes.c_uint32),
-        ("trade_exch", ctypes.c_uint32),
-        ("conditions", ctypes.c_uint32),
-        ("_pad", ctypes.c_uint8 * 24),
-    ]
-
-class FrameHeaderStruct(ctypes.Structure):
-    _pack_ = 8
-    _fields_ = [
-        ("sequence", ctypes.c_int64),
-        ("start_timestamp_ns", ctypes.c_int64),
-        ("end_timestamp_ns", ctypes.c_int64),
-        ("num_symbols", ctypes.c_uint32),
-        ("num_features", ctypes.c_uint32),
-        ("flags", ctypes.c_uint32),
-        ("_pad", ctypes.c_uint8 * 36),
-    ]
-
-assert ctypes.sizeof(GlobalHeaderStruct) == 1024
-assert ctypes.sizeof(SymbolSnapshotStruct) == 128
-assert ctypes.sizeof(FrameHeaderStruct) == 64
-```
-
----
-
-## 4. Synchronization Protocol & Memory Invariants
-
-### 4.1 SeqLock Protocol for Latest Snapshot Table
-
-Top-of-book reads must never stall incoming ticks, and readers must never observe torn multi-word structs (e.g. `bid_px` from tick $K$ paired with `ask_px` from tick $K+1$).
-
-#### Sequence Diagram: SeqLock Write and Read
-
-```
-   Go Daemon (Writer)                       Python Consumer (Reader)
-          |                                            |
- [Incoming Tick arrives]                               |
-          |                                            |
- 1. Atomic Add seq, +1 (Odd = Busy)                    |
-    Store-Release                                      |
-          |                                            |
- 2. Write Fields:                                      |
-    - bid_px, ask_px, sizes                            |
-    - midprice, spread, timestamps                     |
-          |                                            |
- 3. Atomic Add seq, +1 (Even = Clean)                  |
-    Store-Release                                      |
-          |                                            |
-          |                                  1. Load seq1 (Load-Acquire)
-          |                                  2. If seq1 is ODD -> CPU Pause / Retry
-          |                                  3. Copy fields into local struct
-          |                                  4. Load seq2 (Load-Acquire)
-          |                                  5. If seq1 != seq2 -> Torn read, Retry
-          |                                            |
-          v                                            v
-```
-
-#### Memory Invariants:
-- On x86-64, standard stores have release semantics, but a compiler barrier (`runtime.KeepAlive` / Go atomic) prevents instruction reordering across the sequence increment boundary.
-- On ARM64 (Apple Silicon / AWS Graviton), explicit Store-Release (`atomic.Store` / release barrier) and Load-Acquire instructions are strictly required.
-
----
-
-### 4.2 Single-Producer Single-Consumer (SPSC) Cadence Synchronization
-
-#### Sequence Tracking:
-- Ring slots are indexed via bitwise AND: `slot_idx = sequence & (max_frames - 1)`.
-- `last_written_seq`: Sequence number of the most recently finalized frame.
-- `last_read_seq`: Sequence number acknowledged by the Python consumer.
-
-#### Invariants by Mode:
-
-```
-Mode: LIVE STREAMING
-+-------------------------------------------------------------------------------+
-| Invariant: Go daemon NEVER blocks on consumer progress.                       |
-| Write Step:                                                                   |
-|   1. Write frame header + [N][D] feature matrix into slot_idx.                |
-|   2. Memory barrier (Store-Release).                                          |
-|   3. Atomic Store `last_written_seq` = new_seq.                               |
-| Overrun Detection:                                                            |
-|   If (last_written_seq - last_read_seq) >= max_frames:                        |
-|     - Reader has fallen behind. Increment `overrun_count`.                    |
-|     - Python reader catches up by jumping to `last_written_seq - 1`.          |
-+-------------------------------------------------------------------------------+
-
-Mode: HISTORICAL REPLAY
-+-------------------------------------------------------------------------------+
-| Invariant: Go daemon NEVER overwrites unconsumed data (lossless stepping).    |
-| Flow Control:                                                                 |
-|   While (target_seq - last_read_seq) >= max_frames:                           |
-|     - Daemon spins / yields until Python reader advances `last_read_seq`.     |
-|   Once space opens:                                                           |
-|     - Write frame payload.                                                    |
-|     - Store-Release `last_written_seq` = target_seq.                          |
-| Consumer Step:                                                                |
-|   - Awaits `last_written_seq >= next_expected_seq`.                           |
-|   - Processes tensor batch.                                                   |
-|   - Store-Release `last_read_seq` = next_expected_seq.                        |
-+-------------------------------------------------------------------------------+
-```
-
----
-
-### 4.3 Edge Cases & Failure Recovery
-
-1. **Zombie Readers & Replay Deadlock:**
-   - In replay mode, if the Python consumer crashes without updating `last_read_seq`, the Go daemon could block indefinitely.
-   - **Mitigation:** The Go daemon monitors `consumer_pid` and `consumer_heartbeat`. If the consumer process dies (verified via `kill(pid, 0)`), the daemon halts replay with an explicit error rather than hanging.
-
-2. **Illiquid Symbols (Zero Ticks in a 1-Second Window):**
-   - If an asset does not trade or quote within an interval:
-     - Prices (`last_bid_px`, `last_ask_px`, `last_trade_px`): **Forward-filled** from previous interval PIT state.
-     - Flow metrics (`buy_volume`, `sell_volume`, `trade_count`): Zero-filled (`0.0`).
-     - Microstructure metrics (`staleness_ms`): Incremented by `interval_ms`.
-   - Result: Continuous, non-NaN tensor matrices guaranteed for model stability.
-
-3. **Buffer Wrap Math:**
-   - All sequence counters are 64-bit signed integers. At 1 Hz cadence, 64-bit counter overflow requires $2^{63} \text{ seconds} \approx 292 \text{ billion years}$, eliminating sequence wrap bugs.
-   - Ring slot indexing always uses bitmask: `slot = uint64(seq) & uint64(max_frames - 1)`.
-
----
-
-## 5. Architectural Decisions Locked In & Roadmap
-
-### 5.1 Approved Architectural Decisions
-1. **Precision Contract (`float64`)**:
-   - The Cadence feature matrix `[N_SYMBOLS, N_FEATURES]` in `/dev/shm` is strictly `float64` (8 bytes per metric).
-   - Guarantees bit-level parity with upstream quant pipelines and models in `/mnt/wc/src` without precision conversion penalties.
-2. **Static Universe Registration**:
-   - The symbol universe is fixed at daemon startup via `config.yaml` (`universe.symbols`).
-   - Pre-allocates deterministic memory strides and indices in shared memory. Intraday additions require restarting the daemon.
-3. **Parquet for Historical Replay**:
-   - Historical playback ingests standard Parquet tick files (quotes and trades) using pure Go (`github.com/parquet-go/parquet-go`).
-   - SPSC sequence gating ensures Python consumer steps deterministically through bars without dropping ticks or frames.
-
-### 5.2 Roadmap & Extensions
-1. **`tickhub-relay` Network Forwarder:**
-   - Multi-node fanout: lightweight daemon forwarding `/dev/shm` frames over UDP Multicast or kernel-bypass TCP.
-2. **GPU Direct Memory / CUDA IPC:**
-   - Map `/dev/shm` directly into GPU memory via CUDA Host Mapped Memory (`cudaHostRegister`) for zero-copy CPU-to-GPU forward passes.
-
----
-
-*End of Design Document.*

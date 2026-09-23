@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tickhub"
+version = "0.1.0"
+description = "High-performance POSIX SHM reader for 1Hz market data metrics and top-of-book quotes"
+authors = [
+    { name = "Ben Wulfe" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.22.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0.0"]
+test = [
+    "pytest>=8.0.0",
+    "torch>=2.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tickhub*"]
+
+[tool.setuptools.package-data]
+tickhub = ["*.so"]
