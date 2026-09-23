@@ -49,9 +49,9 @@ type GlobalHeader struct {
 	CadenceInterval uint64 // nanoseconds (e.g. 1_000_000_000)
 	DaemonPID       int64
 	HeartbeatNS     int64
+	FirstAnchorNS   int64
 
 	// Producer Cache Line (Aligned to 64 bytes at offset 0x0040)
-	_pad0                 [8]byte
 	AnchorPublishLatencyNS int64
 	WatermarkBufferNS     int64
 	LastWrittenAnchorNS   int64

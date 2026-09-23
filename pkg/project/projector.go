@@ -1,0 +1,198 @@
+package project
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/benwulfe-fb/tickhub/pkg/feed"
+	"github.com/benwulfe-fb/tickhub/pkg/shm"
+)
+
+// Projector aggregates ticks and commits 1Hz multi-phase features into POSIX SHM.
+type Projector struct {
+	producer      *shm.Producer
+	cadenceNS     int64
+	phases        []shm.PhaseConfig
+	uniqueSymbols []string
+	symToUnique   map[string]int
+
+	// Per-phase symbol histories: [phaseIdx][symbolPhaseIdx]
+	histories [][]*SymbolHistory
+
+	// Mapping: symbol -> []PhaseRef{phaseIdx, symbolPhaseIdx}
+	symbolPhaseRefs map[string][]phaseRef
+
+	// Current target anchor per phase
+	phaseNextAnchor []int64
+	phaseSlots      []int
+
+	featBuffer []float64
+}
+
+type phaseRef struct {
+	phaseIdx       int
+	symbolPhaseIdx int
+}
+
+// NewProjector creates and initializes the 1Hz projection engine.
+func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbols []string, cadence time.Duration) *Projector {
+	cadenceNS := cadence.Nanoseconds()
+	if cadenceNS <= 0 {
+		cadenceNS = int64(time.Second)
+	}
+
+	symToUnique := make(map[string]int, len(uniqueSymbols))
+	for i, s := range uniqueSymbols {
+		symToUnique[s] = i
+	}
+
+	histories := make([][]*SymbolHistory, len(phases))
+	symbolPhaseRefs := make(map[string][]phaseRef)
+
+	for pIdx, p := range phases {
+		histories[pIdx] = make([]*SymbolHistory, len(p.Symbols))
+		for sIdx, s := range p.Symbols {
+			histories[pIdx][sIdx] = &SymbolHistory{}
+			symbolPhaseRefs[s] = append(symbolPhaseRefs[s], phaseRef{
+				phaseIdx:       pIdx,
+				symbolPhaseIdx: sIdx,
+			})
+		}
+	}
+
+	return &Projector{
+		producer:        producer,
+		cadenceNS:       cadenceNS,
+		phases:          phases,
+		uniqueSymbols:   uniqueSymbols,
+		symToUnique:     symToUnique,
+		histories:       histories,
+		symbolPhaseRefs: symbolPhaseRefs,
+		phaseNextAnchor: make([]int64, len(phases)),
+		phaseSlots:      make([]int, len(phases)),
+		featBuffer:      make([]float64, 5),
+	}
+}
+
+// IngestTick processes a market tick and commits completed 1Hz frames when time boundaries are crossed.
+func (p *Projector) IngestTick(tick feed.Tick) error {
+	ts := tick.SIPTimestampNS
+
+	// 1. Initialize phase start anchors on first tick
+	for pIdx, pCfg := range p.phases {
+		if p.phaseNextAnchor[pIdx] == 0 {
+			offsetNS := int64(pCfg.OffsetMS) * 1_000_000
+			firstAnchor := ((ts-offsetNS)/p.cadenceNS)*p.cadenceNS + offsetNS
+			if firstAnchor <= ts {
+				firstAnchor += p.cadenceNS
+			}
+			p.phaseNextAnchor[pIdx] = firstAnchor
+		}
+	}
+
+	// 2. Check if any phase has completed its window
+	for {
+		earliestPIdx := -1
+		var earliestAnchor int64 = 0
+
+		for pIdx := range p.phases {
+			target := p.phaseNextAnchor[pIdx]
+			if ts >= target {
+				if earliestAnchor == 0 || target < earliestAnchor {
+					earliestAnchor = target
+					earliestPIdx = pIdx
+				}
+			}
+		}
+
+		if earliestPIdx < 0 {
+			break
+		}
+
+		// Close window for earliestPIdx at earliestAnchor
+		if err := p.closePhase(earliestPIdx, earliestAnchor); err != nil {
+			return err
+		}
+		p.phaseNextAnchor[earliestPIdx] += p.cadenceNS
+		p.phaseSlots[earliestPIdx]++
+	}
+
+	// 3. Update top-of-book snapshot for unique symbol
+	if uIdx, ok := p.symToUnique[tick.Symbol]; ok {
+		p.updateSnapshot(uIdx, tick)
+	}
+
+	// 4. Update rolling history for all phases containing this symbol (including cross-assets)
+	refs := p.symbolPhaseRefs[tick.Symbol]
+	for _, ref := range refs {
+		hist := p.histories[ref.phaseIdx][ref.symbolPhaseIdx]
+		if tick.Type == feed.TickTrade {
+			hist.UpdateTrade(tick.Price, tick.Size)
+		} else {
+			hist.UpdateQuote(tick.BidPx, tick.AskPx)
+		}
+	}
+
+	return nil
+}
+
+func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
+	pCfg := p.phases[pIdx]
+	slot := p.phaseSlots[pIdx]
+
+	for sIdx := range pCfg.Symbols {
+		hist := p.histories[pIdx][sIdx]
+		r1, r5, r15, v1, sp := hist.CloseBar(slot)
+
+		p.featBuffer[0] = r1
+		p.featBuffer[1] = r5
+		p.featBuffer[2] = r15
+		p.featBuffer[3] = v1
+		p.featBuffer[4] = sp
+
+		if err := p.producer.CommitSymbolMetrics(pIdx, sIdx, anchorNS, p.featBuffer); err != nil {
+			return fmt.Errorf("commit metrics p%d s%d @ %d: %w", pIdx, sIdx, anchorNS, err)
+		}
+	}
+
+	p.producer.CommitFrameFinalize(anchorNS)
+	return nil
+}
+
+func (p *Projector) updateSnapshot(uIdx int, tick feed.Tick) {
+	snap := &shm.SymbolSnapshot{
+		SIPTimestampNS:  tick.SIPTimestampNS,
+		RecvTimestampNS: tick.SIPTimestampNS,
+	}
+
+	if tick.Type == feed.TickTrade {
+		snap.LastTradePx = tick.Price
+		snap.LastTradeSz = tick.Size
+	} else {
+		snap.BidPx = tick.BidPx
+		snap.AskPx = tick.AskPx
+		snap.BidSz = tick.BidSz
+		snap.AskSz = tick.AskSz
+		if tick.BidPx > 0 && tick.AskPx > 0 {
+			snap.Midprice = (tick.BidPx + tick.AskPx) / 2.0
+			snap.Spread = tick.AskPx - tick.BidPx
+		}
+	}
+
+	p.producer.WriteSnapshot(uIdx, snap)
+}
+
+// Flush closes remaining bars up to targetEndNS.
+func (p *Projector) Flush(targetEndNS int64) error {
+	for pIdx := range p.phases {
+		for p.phaseNextAnchor[pIdx] <= targetEndNS {
+			anchor := p.phaseNextAnchor[pIdx]
+			if err := p.closePhase(pIdx, anchor); err != nil {
+				return err
+			}
+			p.phaseNextAnchor[pIdx] += p.cadenceNS
+			p.phaseSlots[pIdx]++
+		}
+	}
+	return nil
+}

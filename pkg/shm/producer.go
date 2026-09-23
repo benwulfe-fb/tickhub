@@ -1,9 +1,12 @@
 package shm
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 )
@@ -26,18 +29,25 @@ type Config struct {
 	CadenceInterval time.Duration
 	Permissions     uint32
 	UnlinkOnExit    bool
+	Mode            uint32 // ModeLiveStreaming (0) or ModeHistoricalReplay (1)
 }
+
+var (
+	ErrFlowControlTimeout = fmt.Errorf("replay flow control timeout waiting for consumer")
+	ErrConsumerDeadlock   = fmt.Errorf("consumer process terminated or deadlocked")
+)
 
 // Producer manages writes into POSIX shared memory.
 type Producer struct {
-	cfg          Config
-	segment      *Segment
-	header       *GlobalHeader
-	snapshots    []*SymbolSnapshot
-	phaseOffsets []uintptr
-	phaseStrides []uintptr
-	symbolMap    map[string]int // symbol name -> directory index
-	phaseSymMap  []map[string]int // phase index -> (symbol name -> phase symbol index)
+	cfg           Config
+	segment       *Segment
+	header        *GlobalHeader
+	snapshots     []*SymbolSnapshot
+	phaseOffsets  []uintptr
+	phaseStrides  []uintptr
+	symbolMap     map[string]int // symbol name -> directory index
+	phaseSymMap   []map[string]int // phase index -> (symbol name -> phase symbol index)
+	firstAnchorNS int64
 }
 
 // CreateProducer calculates memory requirements, allocates the segment, formats headers,
@@ -95,7 +105,7 @@ func CreateProducer(cfg Config) (*Producer, error) {
 	header.Magic = MagicBytes
 	header.Version = CurrentABIVersion
 	header.Status = StatusBooting
-	header.Mode = ModeLiveStreaming
+	header.Mode = cfg.Mode
 	header.MaxFrames = cfg.MaxFrames
 	header.NumPhases = uint32(len(cfg.Phases))
 	header.TotalSymbols = uint32(len(cfg.UniqueSymbols))
@@ -179,11 +189,88 @@ func (p *Producer) WriteSnapshot(symbolIdx int, snap *SymbolSnapshot) {
 	atomic.StoreUint64(&target.SeqLockSeq, seq+1)
 }
 
+// WaitConsumerAdvance checks SHM ring buffer capacity in ModeHistoricalReplay.
+// Pauses producer if consumer hasn't read enough frames ahead to prevent overruns.
+func (p *Producer) WaitConsumerAdvance(anchorNS int64, timeout time.Duration) error {
+	if atomic.LoadUint32(&p.header.Mode) != ModeHistoricalReplay {
+		return nil
+	}
+
+	cadenceNS := int64(p.header.CadenceInterval)
+	if cadenceNS <= 0 {
+		cadenceNS = int64(time.Second)
+	}
+
+	maxFrames := int64(p.header.MaxFrames)
+	if maxFrames <= 1 {
+		return nil
+	}
+
+	// Track start anchor
+	if atomic.LoadInt64(&p.header.FirstAnchorNS) == 0 {
+		atomic.CompareAndSwapInt64(&p.header.FirstAnchorNS, 0, anchorNS)
+	}
+	p.firstAnchorNS = atomic.LoadInt64(&p.header.FirstAnchorNS)
+
+	start := time.Now()
+	var lastHB int64
+	lastHBTime := time.Now()
+
+	for {
+		lastRead := atomic.LoadInt64(&p.header.LastReadAnchorNS)
+
+		// Before first consumer read, allow filling buffer up to maxFrames - 2
+		if lastRead == 0 {
+			first := atomic.LoadInt64(&p.firstAnchorNS)
+			if (anchorNS - first) < (maxFrames-2)*cadenceNS {
+				return nil
+			}
+		} else {
+			// Once consumer has started reading, ensure anchor is within ring buffer ahead of lastRead
+			if (anchorNS - lastRead) < (maxFrames-2)*cadenceNS {
+				return nil
+			}
+		}
+
+		// Buffer is full. Check timeout
+		if timeout > 0 && time.Since(start) > timeout {
+			atomic.AddUint64(&p.header.DroppedTickCount, 1)
+			return ErrFlowControlTimeout
+		}
+
+		// Check consumer liveness every 100ms
+		if time.Since(lastHBTime) > 100*time.Millisecond {
+			lastHBTime = time.Now()
+			pid := atomic.LoadInt64(&p.header.ConsumerPID)
+			if pid > 0 {
+				if err := syscall.Kill(int(pid), 0); err != nil && errors.Is(err, syscall.ESRCH) {
+					atomic.AddUint64(&p.header.DroppedTickCount, 1)
+					return ErrConsumerDeadlock
+				}
+			}
+			hb := atomic.LoadInt64(&p.header.ConsumerHeartbeat)
+			if hb != lastHB {
+				lastHB = hb
+			}
+		}
+
+		runtime.Gosched()
+		time.Sleep(50 * time.Microsecond)
+	}
+}
+
 // CommitSymbolMetrics writes D feature float64 values for a symbol within a phase at anchorNS.
 // Performs atomic Store-Release on symbol_anchor_ns[symbolPhaseIdx].
 func (p *Producer) CommitSymbolMetrics(phaseIdx int, symbolPhaseIdx int, anchorNS int64, features []float64) error {
 	if phaseIdx < 0 || phaseIdx >= len(p.phaseOffsets) {
 		return fmt.Errorf("invalid phase index %d", phaseIdx)
+	}
+
+	// In replay mode, throttle on symbol 0 of phase 0
+	if phaseIdx == 0 && symbolPhaseIdx == 0 {
+		if err := p.WaitConsumerAdvance(anchorNS, 10*time.Second); err != nil {
+			return err
+		}
 	}
 
 	cadenceNS := int64(p.header.CadenceInterval)
@@ -225,6 +312,9 @@ func (p *Producer) CommitSymbolMetrics(phaseIdx int, symbolPhaseIdx int, anchorN
 
 // CommitFrameFinalize marks the overall frame committed and updates last_written_anchor_ns.
 func (p *Producer) CommitFrameFinalize(anchorNS int64) {
+	if atomic.LoadInt64(&p.header.FirstAnchorNS) == 0 {
+		atomic.CompareAndSwapInt64(&p.header.FirstAnchorNS, 0, anchorNS)
+	}
 	atomic.StoreInt64(&p.header.LastWrittenAnchorNS, anchorNS)
 }
 
@@ -235,6 +325,16 @@ func (p *Producer) PublishTelemetry(publishLatencyNS, watermarkBufferNS int64, d
 	atomic.StoreUint64(&p.header.DroppedTickCount, droppedTicks)
 	atomic.StoreUint64(&p.header.TotalTickCount, totalTicks)
 	atomic.StoreInt64(&p.header.HeartbeatNS, time.Now().UnixNano())
+}
+
+// Header returns the typed GlobalHeader pointer.
+func (p *Producer) Header() *GlobalHeader {
+	return p.header
+}
+
+// Bytes returns the raw underlying mapped byte slice.
+func (p *Producer) Bytes() []byte {
+	return p.segment.Bytes()
 }
 
 // Close cleanly detaches memory and unlinks if configured.

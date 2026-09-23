@@ -16,6 +16,8 @@ from .abi import (
     HEADER_OFFSET,
     MAGIC_BYTES,
     MAX_PHASES,
+    MODE_HISTORICAL_REPLAY,
+    MODE_LIVE_STREAMING,
     SNAPSHOT_OFFSET,
     FrameHeader,
     GlobalHeader,
@@ -170,9 +172,18 @@ class TickHubReader:
         if not os.path.exists(self._shm_file_path):
             raise FileNotFoundError(f"TickHub SHM segment not found at {self._shm_file_path}")
 
-        self._fd = os.open(self._shm_file_path, os.O_RDONLY)
-        self._file_size = os.fstat(self._fd).st_size
-        self._mmap = mmap.mmap(self._fd, 0, prot=mmap.PROT_READ)
+        self._writable = False
+        try:
+            self._fd = os.open(self._shm_file_path, os.O_RDWR)
+            self._file_size = os.fstat(self._fd).st_size
+            self._mmap = mmap.mmap(self._fd, 0, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+            self._writable = True
+        except (OSError, PermissionError):
+            self._fd = os.open(self._shm_file_path, os.O_RDONLY)
+            self._file_size = os.fstat(self._fd).st_size
+            self._mmap = mmap.mmap(self._fd, 0, prot=mmap.PROT_READ)
+            self._writable = False
+
         self._base_addr = _get_mmap_address(self._mmap)
 
         # Map GlobalHeader
@@ -259,6 +270,17 @@ class TickHubReader:
     def phases(self) -> list[str]:
         return list(self._phase_name_to_idx.keys())
 
+    @property
+    def first_anchor_ns(self) -> int:
+        """Timestamp of first committed frame anchor in SHM."""
+        addr = self._base_addr + GlobalHeader.first_anchor_ns.offset
+        return load_acquire_i64(addr)
+
+    @property
+    def is_replay_mode(self) -> bool:
+        """True if the SHM segment is configured for lossless historical replay."""
+        return self._header.mode == MODE_HISTORICAL_REPLAY
+
     def get_phase_symbols(self, phase_name: str) -> list[str]:
         """Returns the list of symbols configured for the given phase."""
         if phase_name not in self._phase_symbols:
@@ -290,12 +312,26 @@ class TickHubReader:
         all_cursors: list[SymbolCursor] = []
         steps_loaded = 0
 
+        if self.is_replay_mode:
+            # In replay mode, wait for producer to write initial frame
+            while self.first_anchor_ns == 0 and self.last_written_anchor_ns == 0:
+                cpu_pause()
+                time.sleep(0.001)
+
         for phase_name in self.phases:
             p_idx = self._phase_name_to_idx[phase_name]
             symbols = self._phase_symbols[phase_name]
-            latest_anchor = self.get_latest_phase_anchor(phase_name)
-            # Default start anchor: latest anchor
-            target_anchor = latest_anchor
+            offset_ms = self._phase_infos[p_idx].offset_ms
+            offset_ns = offset_ms * 1_000_000
+
+            if self.is_replay_mode:
+                first = self.first_anchor_ns
+                target_anchor = ((first - offset_ns) // self.cadence_ns) * self.cadence_ns + offset_ns
+                if target_anchor < first:
+                    target_anchor += self.cadence_ns
+            else:
+                latest_anchor = self.get_latest_phase_anchor(phase_name)
+                target_anchor = latest_anchor
 
             for s_idx, sym in enumerate(symbols):
                 cursor = SymbolCursor(
@@ -383,9 +419,9 @@ class TickHubReader:
         if not cursors:
             return []
 
-        # Check staleness: if ANY cursor is stale, skip sleep and catch up immediately
+        # Check staleness: if in replay mode or ANY cursor is stale, skip sleep and drain immediately
         any_stale = any(c.is_stale for c in cursors)
-        if not any_stale:
+        if not self.is_replay_mode and not any_stale:
             now_ns = time.time_ns()
             latency_ns = self.anchor_publish_latency_ns
             min_target_ns = min(c.target_anchor_ns for c in cursors)
@@ -407,7 +443,7 @@ class TickHubReader:
             return []
 
         any_stale = any(c.is_stale for c in cursors)
-        if not any_stale:
+        if not self.is_replay_mode and not any_stale:
             now_ns = time.time_ns()
             latency_ns = self.anchor_publish_latency_ns
             min_target_ns = min(c.target_anchor_ns for c in cursors)
@@ -446,7 +482,7 @@ class TickHubReader:
             # Check for ring buffer lag (overwritten frame)
             last_written = self.last_written_anchor_ns
             oldest_valid = last_written - int(self.max_frames - 1) * self.cadence_ns
-            if target_anchor < oldest_valid and last_written > 0:
+            if not self.is_replay_mode and target_anchor < oldest_valid and last_written > 0:
                 raise LaggedAnchorError(cursor.symbol, cursor.phase, target_anchor, last_written)
 
             # Symbol anchor address
@@ -461,10 +497,16 @@ class TickHubReader:
                     committed = True
                     break
                 if loaded_anchor > target_anchor:
-                    # Slot was already overwritten by future anchor
-                    raise LaggedAnchorError(cursor.symbol, cursor.phase, target_anchor, loaded_anchor)
+                    if not self.is_replay_mode:
+                        # Slot was already overwritten by future anchor
+                        raise LaggedAnchorError(cursor.symbol, cursor.phase, target_anchor, loaded_anchor)
+                    else:
+                        break
 
                 if (time.time_ns() - start_wait) > timeout_ns:
+                    failed_symbols.append(cursor.symbol)
+                    break
+                if self.status == 4:  # StatusClosed
                     failed_symbols.append(cursor.symbol)
                     break
                 cpu_pause()
@@ -491,6 +533,23 @@ class TickHubReader:
         """Synchronously advances all cursors in the collection by one cadence step."""
         for c in cursors:
             c.next()
+
+    def commit_read(self, cursors: list[SymbolCursor]) -> None:
+        """Signals progress to Go daemon in replay mode using min target anchor across active cursors.
+
+        Updating LastReadAnchorNS allows the Go daemon to advance without buffer overruns.
+        """
+        if not cursors or not getattr(self, "_writable", False):
+            return
+        min_anchor = min(c.target_anchor_ns for c in cursors)
+        addr = self._base_addr + GlobalHeader.last_read_anchor_ns.offset
+        hb_addr = self._base_addr + GlobalHeader.consumer_heartbeat.offset
+        pid_addr = self._base_addr + GlobalHeader.consumer_pid.offset
+
+        ctypes.c_int64.from_address(pid_addr).value = os.getpid()
+        ctypes.c_int64.from_address(hb_addr).value = time.time_ns()
+        ctypes.c_int64.from_address(addr).value = min_anchor
+        thread_fence_acquire()
 
     def load_symbol_history(
         self,

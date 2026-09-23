@@ -117,3 +117,64 @@ func TestProducerLifecycleAndCommit(t *testing.T) {
 		t.Fatalf("telemetry dropped ticks mismatch")
 	}
 }
+
+func TestReplayFlowControlBackpressure(t *testing.T) {
+	cfg := Config{
+		Name:      "test_replay_backpressure",
+		MaxFrames: 8,
+		Mode:      ModeHistoricalReplay,
+		Phases: []PhaseConfig{
+			{
+				ID:       0,
+				Name:     "phase_0ms",
+				OffsetMS: 0,
+				Symbols:  []string{"SPY"},
+			},
+		},
+		UniqueSymbols:   []string{"SPY"},
+		Features:        []string{"feat_a"},
+		CadenceInterval: 1 * time.Second,
+		UnlinkOnExit:    true,
+	}
+
+	prod, err := CreateProducer(cfg)
+	if err != nil {
+		t.Fatalf("CreateProducer failed: %v", err)
+	}
+	defer prod.Close()
+
+	startAnchor := int64(1700000000_000_000_000)
+
+	// Fill buffer up to maxFrames - 2 (which is 6 frames: f=0..5)
+	for f := 0; f < 6; f++ {
+		anchor := startAnchor + int64(f)*1_000_000_000
+		if err := prod.CommitSymbolMetrics(0, 0, anchor, []float64{float64(f)}); err != nil {
+			t.Fatalf("frame %d commit failed: %v", f, err)
+		}
+		prod.CommitFrameFinalize(anchor)
+	}
+
+	// Now buffer is full (anchor 6 will pause).
+	// In background, advance consumer LastReadAnchorNS after 50ms.
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		// Advance consumer to frame 3
+		atomic.StoreInt64(&prod.header.LastReadAnchorNS, startAnchor+3*1_000_000_000)
+	}()
+
+	anchor6 := startAnchor + 6*1_000_000_000
+	t0 := time.Now()
+	if err := prod.CommitSymbolMetrics(0, 0, anchor6, []float64{6.0}); err != nil {
+		t.Fatalf("frame 6 commit should succeed after consumer advance, got: %v", err)
+	}
+	elapsed := time.Since(t0)
+
+	if elapsed < 30*time.Millisecond {
+		t.Fatalf("expected producer to wait for consumer advance, but elapsed was only %v", elapsed)
+	}
+
+	if atomic.LoadUint64(&prod.header.DroppedTickCount) != 0 {
+		t.Fatalf("expected 0 dropped/overrun frames, got %d", prod.header.DroppedTickCount)
+	}
+}
+

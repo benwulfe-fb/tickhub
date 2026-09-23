@@ -45,7 +45,7 @@ class GlobalHeader(ctypes.Structure):
         ("cadence_interval", ctypes.c_uint64),
         ("daemon_pid", ctypes.c_int64),
         ("heartbeat_ns", ctypes.c_int64),
-        ("_pad0", ctypes.c_uint8 * 8),
+        ("first_anchor_ns", ctypes.c_int64),
         ("anchor_publish_latency_ns", ctypes.c_int64),
         ("watermark_buffer_ns", ctypes.c_int64),
         ("last_written_anchor_ns", ctypes.c_int64),
