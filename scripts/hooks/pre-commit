@@ -1,0 +1,52 @@
+#!/bin/sh
+# pre-commit — reminder backstop for the codereview.py commit gate in tickhub.
+#
+# Surfaces the operating protocol at commit time: if committing code/config
+# without an APPROVED <ledger>-codereview.md, prints the reminder and the
+# one-step override, then exits non-zero.
+#
+# Install:  git config core.hooksPath scripts/hooks
+# Disable:  git config --unset core.hooksPath
+
+set -eu
+
+# 1. Staged code/config files only. Nothing relevant staged -> let commit through silently.
+staged=$(git diff --cached --name-only -- pkg cmd python c scripts tests examples Makefile go.mod go.sum GEMINI.md .gitignore 2>/dev/null || true)
+if [ -z "$staged" ]; then
+    exit 0
+fi
+
+# 2. Resolve current ledger: latest aiChangeLog/<date>/<seqno>_*.md (ignoring review files)
+ledger=$(ls aiChangeLog/*/*.md 2>/dev/null | grep -v -e '-planreview.*\.md$' -e '-codereview\.md$' | sort | tail -1 || true)
+
+# 3. An APPROVED codereview for that ledger clears the reminder.
+if [ -n "$ledger" ]; then
+    codereview=$(printf '%s' "$ledger" | sed 's/\.md$/-codereview.md/')
+    if [ -f "$codereview" ] && grep -Eiq '^[*_[:space:]]*APPROVED[*_[:space:].,;:!]*$' "$codereview"; then
+        echo "[pre-commit] APPROVED codereview found for $ledger — commit allowed."
+        exit 0
+    fi
+fi
+
+# 4. No APPROVED codereview -> remind and block unless --no-verify is used.
+cat >&2 <<EOF
+
+  ====================== CODE REVIEW GATE (reminder) ======================
+  You are committing code/config in tickhub but no APPROVED
+  code review was found for the current ledger:
+      ledger:     ${ledger:-<none found under aiChangeLog/>}
+      codereview: ${ledger:+$(printf '%s' "$ledger" | sed 's/\.md$/-codereview.md/')}
+
+  The operating protocol is:
+      validate_all.py GREEN  ->  run codereview.py  ->  read verdict
+      ->  commit ONLY when <ledger>-codereview.md says APPROVED.
+
+  Run:
+      /mnt/wc/miniconda3/envs/gpu_env/bin/python -u scripts/codereview.py ${ledger:-aiChangeLog/<date>/<seqno>_*.md}
+
+  To commit anyway (with explicit operator confirmation):
+      git commit --no-verify ...
+  =========================================================================
+
+EOF
+exit 1

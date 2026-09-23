@@ -43,6 +43,9 @@ func main() {
 		runReplay(os.Args[2:])
 	case "version":
 		fmt.Println("TickHub v0.1.0 (Phase 2: Parquet Replay & 1Hz Projection)")
+	case "help", "-h", "--help":
+		printUsage()
+		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
