@@ -18,6 +18,10 @@ _lib.tickhub_atomic_load_acquire_i64.restype = ctypes.c_int64
 _lib.tickhub_atomic_thread_fence_acquire.argtypes = []
 _lib.tickhub_atomic_thread_fence_acquire.restype = None
 
+# void tickhub_atomic_thread_fence_release(void)
+_lib.tickhub_atomic_thread_fence_release.argtypes = []
+_lib.tickhub_atomic_thread_fence_release.restype = None
+
 # void tickhub_cpu_pause(void)
 _lib.tickhub_cpu_pause.argtypes = []
 _lib.tickhub_cpu_pause.restype = None
@@ -31,6 +35,11 @@ def load_acquire_i64(addr: int | ctypes.c_void_p) -> int:
 def thread_fence_acquire() -> None:
     """Hardware thread fence with acquire ordering."""
     _lib.tickhub_atomic_thread_fence_acquire()
+
+
+def thread_fence_release() -> None:
+    """Hardware thread fence with release ordering."""
+    _lib.tickhub_atomic_thread_fence_release()
 
 
 def cpu_pause() -> None:

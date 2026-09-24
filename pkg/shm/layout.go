@@ -25,6 +25,18 @@ const (
 	// Operational modes
 	ModeLiveStreaming   uint32 = 0
 	ModeHistoricalReplay uint32 = 1
+
+	// Control Line Commands (Consumer -> Producer)
+	CmdIdle        uint32 = 0
+	CmdReplayChunk uint32 = 1
+	CmdShutdown    uint32 = 2
+
+	// Control Line Statuses (Producer -> Consumer)
+	ControlStatusIdle    uint32 = 0
+	ControlStatusBusy    uint32 = 1
+	ControlStatusReady   uint32 = 2
+	ControlStatusError   uint32 = 3
+	ControlStatusEOF     uint32 = 4
 )
 
 // PhaseInfo describes a single phase's geometry in the SHM header.
@@ -65,10 +77,39 @@ type GlobalHeader struct {
 	ConsumerHeartbeat int64
 	_padConsumer      [40]byte
 
-	// Phase geometry descriptors (up to 8 phases = 8 * 32 = 256 bytes)
+	// Phase geometry descriptors (up to 8 phases = 8 * 32 = 256 bytes at offset 0x00C0)
 	Phases [MaxPhases]PhaseInfo
 
-	_reserved [576]byte
+	// Control Line (Consumer line at offset 0x01C0 = 448 bytes)
+	ControlReq ControlRequest
+
+	// Control Line (Producer line at offset 0x0200 = 512 bytes)
+	ControlResp ControlResponse
+
+	_reserved [448]byte
+}
+
+// ControlRequest is written by the consumer on a dedicated 64-byte cache line (offset 0x01C0).
+type ControlRequest struct {
+	RequestID     uint64   // 8 bytes: monotonic request sequence number
+	Command       uint32   // 4 bytes: CmdIdle, CmdReplayChunk, CmdShutdown
+	Date          uint32   // 4 bytes: integer YYYYMMDD (e.g. 20260506)
+	Symbol        [8]byte  // 8 bytes: null-padded ASCII ticker (e.g. "DASH\0\0\0\0")
+	StartAnchorNS int64    // 8 bytes: window start nanoseconds (inclusive)
+	EndAnchorNS   int64    // 8 bytes: window end nanoseconds (exclusive)
+	_pad          [24]byte // 24 bytes: padding to 64 bytes
+}
+
+// ControlResponse is written by the producer on a dedicated 64-byte cache line (offset 0x0200).
+type ControlResponse struct {
+	ResponseID       uint64   // 8 bytes: echoes RequestID when completed
+	Status           uint32   // 4 bytes: ControlStatusIdle, ControlStatusBusy, ControlStatusReady, etc.
+	NumFramesWritten uint32   // 4 bytes: number of 1Hz frames committed to ring buffer
+	ColdStartFrames  uint32   // 4 bytes: frames prior to first quote
+	_pad             uint32   // 4 bytes: explicit alignment padding for 8-byte boundary
+	FirstAnchorNS    int64    // 8 bytes: first committed frame anchor
+	LastAnchorNS     int64    // 8 bytes: last committed frame anchor
+	ErrorMsg         [24]byte // 24 bytes: null-terminated error string if Status==ControlStatusError
 }
 
 // SymbolDirectoryEntry describes a symbol in the directory (16 bytes).
@@ -113,6 +154,8 @@ type FrameHeader struct {
 // Compile-time struct size verifications to guarantee binary ABI stability.
 var (
 	_ [1024]byte = [unsafe.Sizeof(GlobalHeader{})]byte{}
+	_ [64]byte   = [unsafe.Sizeof(ControlRequest{})]byte{}
+	_ [64]byte   = [unsafe.Sizeof(ControlResponse{})]byte{}
 	_ [16]byte   = [unsafe.Sizeof(SymbolDirectoryEntry{})]byte{}
 	_ [128]byte  = [unsafe.Sizeof(SymbolSnapshot{})]byte{}
 	_ [64]byte   = [unsafe.Sizeof(FrameHeader{})]byte{}

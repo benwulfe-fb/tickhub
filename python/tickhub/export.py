@@ -122,7 +122,7 @@ def export_features(
                 # Check termination
                 if max_frames > 0 and total_frames_processed >= max_frames:
                     break
-                if hub.status == 4:  # StatusClosed
+                if hub.status == 4 and all(c.target_anchor_ns > hub.last_written_anchor_ns for c in all_cursors):
                     break
 
         except Exception as e:

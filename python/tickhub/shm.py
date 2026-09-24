@@ -19,13 +19,23 @@ from .abi import (
     MODE_HISTORICAL_REPLAY,
     MODE_LIVE_STREAMING,
     SNAPSHOT_OFFSET,
+    CMD_IDLE,
+    CMD_REPLAY_CHUNK,
+    CMD_SHUTDOWN,
+    CONTROL_STATUS_IDLE,
+    CONTROL_STATUS_BUSY,
+    CONTROL_STATUS_READY,
+    CONTROL_STATUS_ERROR,
+    CONTROL_STATUS_EOF,
+    ControlRequest,
+    ControlResponse,
     FrameHeader,
     GlobalHeader,
     PhaseInfo,
     SymbolDirectoryEntry,
     SymbolSnapshot,
 )
-from .atomic import cpu_pause, load_acquire_i64, thread_fence_acquire
+from .atomic import cpu_pause, load_acquire_i64, thread_fence_acquire, thread_fence_release
 
 
 class LaggedAnchorError(Exception):
@@ -163,6 +173,10 @@ class TickHubReader:
             or self.config.get("shm_name")
             or "tickhub_default"
         )
+        if shm_name.startswith("/dev/shm/"):
+            shm_name = shm_name[len("/dev/shm/"):]
+        elif shm_name.startswith("dev/shm/"):
+            shm_name = shm_name[len("dev/shm/"):]
         clean_name = shm_name.lstrip("/")
         if not clean_name.startswith("tickhub_"):
             clean_name = "tickhub_" + clean_name
@@ -554,6 +568,85 @@ class TickHubReader:
         ctypes.c_int64.from_address(hb_addr).value = time.time_ns()
         ctypes.c_int64.from_address(addr).value = min_anchor
         thread_fence_acquire()
+
+    def request_chunk(
+        self,
+        symbol: str,
+        date_str: str,
+        start_anchor_ns: int,
+        end_anchor_ns: int,
+        timeout_s: float = 5.0,
+    ) -> tuple[int, int]:
+        """Commands the persistent Go tickhub worker daemon to replay a chunk into SHM.
+
+        Ring buffer slots are addressed deterministically via modulo anchor time:
+            slot = (anchor_ns // cadence_ns) & (max_frames - 1)
+        Frames for anchors in (start_anchor_ns, end_anchor_ns] are written directly
+        to their respective modulo slots. Client readers consume frames by advancing
+        cursors initialized to start_anchor_ns + cadence_ns.
+
+        Args:
+            symbol: Ticker symbol (e.g. 'DASH')
+            date_str: Date in 'YYYY-MM-DD' or 'YYYYMMDD' format
+            start_anchor_ns: Window start nanoseconds (inclusive)
+            end_anchor_ns: Window end nanoseconds (exclusive)
+            timeout_s: Maximum seconds to wait for daemon response
+
+        Returns:
+            (num_frames_written, cold_start_frames)
+        """
+        if not getattr(self, "_writable", False):
+            raise PermissionError("TickHubReader must be opened O_RDWR to issue control line requests")
+
+        req = self._header.control_req
+        resp = self._header.control_resp
+
+        # Monotonic request sequence number
+        req_id = max(getattr(self, "_last_req_id", 0), resp.response_id) + 1
+        self._last_req_id = req_id
+
+        date_int = int(date_str.replace("-", ""))
+        sym_bytes = symbol.encode("ascii")[:8].ljust(8, b"\x00")
+
+        # Register consumer PID
+        pid_addr = self._base_addr + GlobalHeader.consumer_pid.offset
+        hb_addr = self._base_addr + GlobalHeader.consumer_heartbeat.offset
+        ctypes.c_int64.from_address(pid_addr).value = os.getpid()
+        ctypes.c_int64.from_address(hb_addr).value = time.time_ns()
+
+        req.symbol = sym_bytes
+        req.date = date_int
+        req.start_anchor_ns = start_anchor_ns
+        req.end_anchor_ns = end_anchor_ns
+        req.command = CMD_REPLAY_CHUNK
+        thread_fence_release()  # Store-release fence guarantees payload fields visible before request_id
+        req.request_id = req_id
+
+        timeout_ns = int(timeout_s * 1_000_000_000)
+        t0 = time.time_ns()
+
+        while True:
+            if resp.response_id == req_id:
+                status = resp.status
+                if status == CONTROL_STATUS_READY:
+                    return resp.num_frames_written, resp.cold_start_frames
+                elif status == CONTROL_STATUS_EOF:
+                    return 0, resp.cold_start_frames
+                elif status == CONTROL_STATUS_ERROR:
+                    err_msg = resp.error_msg.decode("ascii", errors="replace").rstrip("\x00")
+                    raise RuntimeError(f"Daemon error servicing chunk: {err_msg}")
+
+            if (time.time_ns() - t0) > timeout_ns:
+                raise TimeoutError(f"Timed out after {timeout_s}s waiting for chunk response for {symbol} {date_str}")
+
+            cpu_pause()
+            time.sleep(0.0001)
+
+    def shutdown_worker(self) -> None:
+        """Sends CmdShutdown to worker daemon."""
+        if getattr(self, "_writable", False):
+            self._header.control_req.command = CMD_SHUTDOWN
+            thread_fence_release()
 
     def load_symbol_history(
         self,

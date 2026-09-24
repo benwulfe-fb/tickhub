@@ -41,6 +41,8 @@ func main() {
 	switch command {
 	case "replay":
 		runReplay(os.Args[2:])
+	case "worker":
+		runWorker(os.Args[2:])
 	case "version":
 		fmt.Println("TickHub v0.1.0 (Phase 2: Parquet Replay & 1Hz Projection)")
 	case "help", "-h", "--help":
@@ -57,6 +59,7 @@ func printUsage() {
 	fmt.Println("Usage: tickhub <command> [options]")
 	fmt.Println("\nCommands:")
 	fmt.Println("  replay    Stream historical Parquet ticks into SHM with lossless backpressure")
+	fmt.Println("  worker    Run persistent DataLoader worker daemon listening on SHM control line")
 	fmt.Println("  version   Print TickHub version")
 }
 

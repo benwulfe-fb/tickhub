@@ -110,8 +110,10 @@ def validate_abi_alignments():
     telemetry.log("==================== [2/7] ABI Alignment & Size Verification ====================")
     check_script = (
         "import sys, ctypes\n"
-        "from tickhub.abi import GlobalHeader, SymbolSnapshot, FrameHeader, SymbolDirectoryEntry, PhaseInfo\n"
+        "from tickhub.abi import GlobalHeader, SymbolSnapshot, FrameHeader, SymbolDirectoryEntry, PhaseInfo, ControlRequest, ControlResponse\n"
         "assert ctypes.sizeof(GlobalHeader) == 1024, f'GlobalHeader size: {ctypes.sizeof(GlobalHeader)}'\n"
+        "assert ctypes.sizeof(ControlRequest) == 64, f'ControlRequest size: {ctypes.sizeof(ControlRequest)}'\n"
+        "assert ctypes.sizeof(ControlResponse) == 64, f'ControlResponse size: {ctypes.sizeof(ControlResponse)}'\n"
         "assert ctypes.sizeof(SymbolSnapshot) == 128, f'SymbolSnapshot size: {ctypes.sizeof(SymbolSnapshot)}'\n"
         "assert ctypes.sizeof(FrameHeader) == 64, f'FrameHeader size: {ctypes.sizeof(FrameHeader)}'\n"
         "assert ctypes.sizeof(SymbolDirectoryEntry) == 16, f'SymbolDirectoryEntry size: {ctypes.sizeof(SymbolDirectoryEntry)}'\n"
@@ -119,10 +121,12 @@ def validate_abi_alignments():
         "assert GlobalHeader.anchor_publish_latency_ns.offset == 64, f'Producer line offset: {GlobalHeader.anchor_publish_latency_ns.offset}'\n"
         "assert GlobalHeader.last_read_anchor_ns.offset == 128, f'Consumer line offset: {GlobalHeader.last_read_anchor_ns.offset}'\n"
         "assert GlobalHeader.phases.offset == 192, f'Phases offset: {GlobalHeader.phases.offset}'\n"
+        "assert GlobalHeader.control_req.offset == 448, f'control_req offset: {GlobalHeader.control_req.offset}'\n"
+        "assert GlobalHeader.control_resp.offset == 512, f'control_resp offset: {GlobalHeader.control_resp.offset}'\n"
         "print('All ABI assertions passed successfully.')\n"
     )
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT / "python") + ":" + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{ROOT / 'python'}:/mnt/wc/src:{env.get('PYTHONPATH', '')}"
     proc = subprocess.run(
         [PYTHON_EXE, "-c", check_script],
         cwd=str(ROOT),
@@ -158,7 +162,7 @@ def validate_python_tests():
     """Run pytest suite excluding golden replay (which runs in stage 6)."""
     telemetry.log("==================== [5/7] Python Pytest Suite ====================")
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT / "python") + ":" + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{ROOT / 'python'}:/mnt/wc/src:{env.get('PYTHONPATH', '')}"
     proc = subprocess.run(
         [PYTHON_EXE, "-m", "pytest", "-v", "--ignore=tests/test_golden_replay.py", "tests/"],
         cwd=str(ROOT),
@@ -182,7 +186,7 @@ def validate_golden_replay():
     """Run golden replay bit-identical certification and performance regression gate."""
     telemetry.log("==================== [6/7] Golden Replay & Performance Regression Gate ====================")
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(ROOT / "python") + ":" + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{ROOT / 'python'}:/mnt/wc/src:{env.get('PYTHONPATH', '')}"
     proc = subprocess.run(
         [PYTHON_EXE, "-m", "pytest", "-v", "-s", "tests/test_golden_replay.py"],
         cwd=str(ROOT),

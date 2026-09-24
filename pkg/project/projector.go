@@ -27,6 +27,10 @@ type Projector struct {
 	phaseSlots      []int
 
 	featBuffer []float64
+
+	firstCommittedAnchor int64
+	lastCommittedAnchor  int64
+	totalCommittedFrames int
 }
 
 type phaseRef struct {
@@ -71,6 +75,32 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 		phaseNextAnchor: make([]int64, len(phases)),
 		phaseSlots:      make([]int, len(phases)),
 		featBuffer:      make([]float64, 5),
+	}
+}
+
+// SetStartAnchor sets the initial window start anchor across all phases.
+func (p *Projector) SetStartAnchor(startNS int64) {
+	for pIdx, pCfg := range p.phases {
+		offsetNS := int64(pCfg.OffsetMS) * 1_000_000
+		firstAnchor := ((startNS-offsetNS)/p.cadenceNS)*p.cadenceNS + offsetNS
+		if firstAnchor <= startNS {
+			firstAnchor += p.cadenceNS
+		}
+		p.phaseNextAnchor[pIdx] = firstAnchor
+	}
+}
+
+// SeedState initializes the prevailing bid, ask, and trade price for a symbol prior to window start.
+func (p *Projector) SeedState(symbol string, lastBid, lastAsk, lastPrice float64) {
+	refs := p.symbolPhaseRefs[symbol]
+	for _, ref := range refs {
+		hist := p.histories[ref.phaseIdx][ref.symbolPhaseIdx]
+		if lastBid > 0 || lastAsk > 0 {
+			hist.UpdateQuote(lastBid, lastAsk)
+		}
+		if lastPrice > 0 {
+			hist.UpdateTrade(lastPrice, 0)
+		}
 	}
 }
 
@@ -156,6 +186,11 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 	}
 
 	p.producer.CommitFrameFinalize(anchorNS)
+	if p.firstCommittedAnchor == 0 {
+		p.firstCommittedAnchor = anchorNS
+	}
+	p.lastCommittedAnchor = anchorNS
+	p.totalCommittedFrames++
 	return nil
 }
 
@@ -195,4 +230,14 @@ func (p *Projector) Flush(targetEndNS int64) error {
 		}
 	}
 	return nil
+}
+
+// CommittedFrames returns the total number of frames committed to SHM.
+func (p *Projector) CommittedFrames() int {
+	return p.totalCommittedFrames
+}
+
+// AnchorRange returns the first and last anchor timestamps committed to SHM.
+func (p *Projector) AnchorRange() (int64, int64) {
+	return p.firstCommittedAnchor, p.lastCommittedAnchor
 }

@@ -10,7 +10,7 @@ from .abi import (
     SymbolDirectoryEntry,
     SymbolSnapshot,
 )
-from .atomic import cpu_pause, load_acquire_i64, thread_fence_acquire
+from .atomic import cpu_pause, load_acquire_i64, thread_fence_acquire, thread_fence_release
 from .shm import LaggedAnchorError, SymbolCursor, TickHubReader
 
 def __getattr__(name: str):
@@ -33,5 +33,6 @@ __all__ = [
     "CURRENT_ABI_VERSION",
     "load_acquire_i64",
     "thread_fence_acquire",
+    "thread_fence_release",
     "cpu_pause",
 ]

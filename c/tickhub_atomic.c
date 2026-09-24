@@ -16,6 +16,11 @@ void tickhub_atomic_thread_fence_acquire(void) {
     atomic_thread_fence(memory_order_acquire);
 }
 
+// Hardware thread fence with Release ordering
+void tickhub_atomic_thread_fence_release(void) {
+    atomic_thread_fence(memory_order_release);
+}
+
 // Low-power CPU pause instruction for microsecond spin loops
 void tickhub_cpu_pause(void) {
 #if defined(__x86_64__) || defined(_M_X64)
