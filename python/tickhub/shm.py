@@ -1,5 +1,6 @@
 import asyncio
 import ctypes
+import logging
 import mmap
 import os
 import time
@@ -8,6 +9,9 @@ from typing import Any, Optional, Union
 
 import numpy as np
 import yaml
+
+logger = logging.getLogger("tickhub.shm")
+logger.addHandler(logging.NullHandler())
 
 from .abi import (
     CURRENT_ABI_VERSION,
@@ -324,6 +328,16 @@ class TickHubReader:
             rec_mode = self._header.recovery_mode
             latest_anchor = self.last_written_anchor_ns
 
+            logger.warning(
+                f"[RESILIENCE] TickHub daemon restart detected: BootID={curr_boot:#x}, "
+                f"Generation={self._generation}, RecoveryMode={rec_mode}"
+            )
+            if self.is_cold_start:
+                logger.warning(
+                    "[RESILIENCE] Restart recovery active with FlagColdStart=True. "
+                    "Model trade execution inhibited during warmup."
+                )
+
             if cursors and latest_anchor > 0:
                 for c in cursors:
                     p_info = self._phase_infos[c.phase_idx]
@@ -599,6 +613,12 @@ class TickHubReader:
             oldest_valid = phase_latest - int(self.max_frames - 1) * self.cadence_ns
             if not self.is_replay_mode and target_anchor < oldest_valid and last_written > 0:
                 if self._auto_realign:
+                    gap_ms = (oldest_valid - target_anchor) / 1e6
+                    logger.warning(
+                        f"[SLO-VIOLATION] [RESILIENCE] Frame lag / buffer overrun detected: "
+                        f"symbol={cursor.symbol}, phase={cursor.phase}, target={target_anchor} < oldest_valid={oldest_valid} "
+                        f"(gap={gap_ms:.1f}ms). Auto-realigning cursor to {phase_latest}."
+                    )
                     target_anchor = phase_latest
                     cursor.target_anchor_ns = phase_latest
                     slot = (target_anchor // self.cadence_ns) & (self.max_frames - 1)

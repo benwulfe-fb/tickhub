@@ -154,8 +154,11 @@ func (c *Client) runStream(ctx context.Context, conn net.Conn) error {
 			return err
 		}
 
-		if lastPacketSeq > 0 && seq != lastPacketSeq+1 {
-			c.seqGaps.Add(int64(seq - lastPacketSeq - 1))
+		if lastPacketSeq > 0 && seq > lastPacketSeq+1 {
+			gap := int64(seq - lastPacketSeq - 1)
+			c.seqGaps.Add(gap)
+			log.Printf("[SLO-VIOLATION] [RELAY-CLI] Sequence gap detected: expected %d, got %d (gap=%d packets)",
+				lastPacketSeq+1, seq, gap)
 		}
 		lastPacketSeq = seq
 
@@ -198,6 +201,11 @@ func (c *Client) runStream(ctx context.Context, conn net.Conn) error {
 			c.producer.CommitFrameFinalize(anchorNS)
 			c.anchorsCount.Add(1)
 			c.lastAnchor.Store(anchorNS)
+
+			if latencyUS > 10000 { // 10ms WAN budget (SLO-06)
+				log.Printf("[SLO-VIOLATION] [RELAY-CLI] Replication latency exceeded 10ms budget: %dµs @ anchor %d",
+					latencyUS, anchorNS)
+			}
 
 			log.Printf("[RELAY-CLI] Replicated anchor %d to /dev/shm/%s (%d snapshots, latency %dµs, gaps=%d, reconnects=%d)",
 				anchorNS, c.cfg.SHMName, appliedSnapshots, latencyUS, c.seqGaps.Load(), c.reconnects.Load())

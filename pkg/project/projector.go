@@ -236,6 +236,7 @@ func (p *Projector) IngestTick(tick feed.Tick) error {
 }
 
 func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
+	startNS := time.Now().UnixNano()
 	pCfg := p.phases[pIdx]
 	slot := p.phaseSlots[pIdx]
 
@@ -258,7 +259,8 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 		p.producer.SetFrameFlags(pIdx, anchorNS, shm.FlagColdStart)
 	}
 
-	p.producer.CommitFrameFinalize(anchorNS)
+	publishLatNS := time.Now().UnixNano() - startNS
+	p.producer.CommitFrameFinalizeWithLatency(anchorNS, publishLatNS)
 	if p.firstCommittedAnchor == 0 {
 		p.firstCommittedAnchor = anchorNS
 	}

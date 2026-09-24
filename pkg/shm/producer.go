@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -465,12 +466,24 @@ func (p *Producer) CommitSymbolMetrics(phaseIdx int, symbolPhaseIdx int, anchorN
 	return nil
 }
 
-// CommitFrameFinalize marks the overall frame committed and updates last_written_anchor_ns.
-func (p *Producer) CommitFrameFinalize(anchorNS int64) {
+// CommitFrameFinalizeWithLatency marks the overall frame committed, records publish latency, and updates last_written_anchor_ns.
+func (p *Producer) CommitFrameFinalizeWithLatency(anchorNS, publishLatNS int64) {
 	if atomic.LoadInt64(&p.header.FirstAnchorNS) == 0 {
 		atomic.CompareAndSwapInt64(&p.header.FirstAnchorNS, 0, anchorNS)
 	}
+	if publishLatNS > 0 {
+		atomic.StoreInt64(&p.header.AnchorPublishLatencyNS, publishLatNS)
+		if publishLatNS > int64(15*time.Millisecond) {
+			log.Printf("[SLO-VIOLATION] 1Hz publish latency exceeded budget: %v > 15ms @ anchor %d",
+				time.Duration(publishLatNS), anchorNS)
+		}
+	}
 	atomic.StoreInt64(&p.header.LastWrittenAnchorNS, anchorNS)
+}
+
+// CommitFrameFinalize marks the overall frame committed and updates last_written_anchor_ns.
+func (p *Producer) CommitFrameFinalize(anchorNS int64) {
+	p.CommitFrameFinalizeWithLatency(anchorNS, 0)
 }
 
 // ResetAnchors resets tracking anchors for chunked replay.
