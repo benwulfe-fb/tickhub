@@ -349,6 +349,45 @@ func (p *Producer) Bytes() []byte {
 	return p.segment.Bytes()
 }
 
+// WriteRawSlot writes raw slot bytes directly into the ring buffer for phaseIdx at slotIdx.
+func (p *Producer) WriteRawSlot(phaseIdx int, slotIdx uint32, rawBytes []byte) error {
+	if phaseIdx < 0 || phaseIdx >= len(p.phaseOffsets) {
+		return fmt.Errorf("invalid phase index %d", phaseIdx)
+	}
+	if slotIdx >= p.header.MaxFrames {
+		return fmt.Errorf("slotIdx %d out of range [0,%d)", slotIdx, p.header.MaxFrames)
+	}
+	stride := p.phaseStrides[phaseIdx]
+	if uintptr(len(rawBytes)) != stride {
+		return fmt.Errorf("raw slot size mismatch: got %d, expected %d", len(rawBytes), stride)
+	}
+	raw := p.segment.Bytes()
+	offset := p.phaseOffsets[phaseIdx] + uintptr(slotIdx)*stride
+	copy(raw[offset:offset+stride], rawBytes)
+	return nil
+}
+
+// ReadRawSlot reads raw slot bytes directly from the ring buffer for phaseIdx at slotIdx, returning a safe copy.
+func (p *Producer) ReadRawSlot(phaseIdx int, slotIdx uint32) ([]byte, error) {
+	if phaseIdx < 0 || phaseIdx >= len(p.phaseOffsets) {
+		return nil, fmt.Errorf("invalid phase index %d", phaseIdx)
+	}
+	if slotIdx >= p.header.MaxFrames {
+		return nil, fmt.Errorf("slotIdx %d out of range [0,%d)", slotIdx, p.header.MaxFrames)
+	}
+	stride := p.phaseStrides[phaseIdx]
+	raw := p.segment.Bytes()
+	offset := p.phaseOffsets[phaseIdx] + uintptr(slotIdx)*stride
+	out := make([]byte, stride)
+	copy(out, raw[offset:offset+stride])
+	return out, nil
+}
+// Segment returns the underlying shared memory Segment.
+func (p *Producer) Segment() *Segment {
+	return p.segment
+}
+
+
 // Close cleanly detaches memory and unlinks if configured.
 func (p *Producer) Close() error {
 	p.SetStatus(StatusClosed)

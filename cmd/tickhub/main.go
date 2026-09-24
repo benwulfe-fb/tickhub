@@ -43,8 +43,14 @@ func main() {
 		runReplay(os.Args[2:])
 	case "worker":
 		runWorker(os.Args[2:])
+	case "daemon":
+		runDaemon(os.Args[2:])
+	case "relay-server":
+		runRelayServer(os.Args[2:])
+	case "relay-client":
+		runRelayClient(os.Args[2:])
 	case "version":
-		fmt.Println("TickHub v0.1.0 (Phase 2: Parquet Replay & 1Hz Projection)")
+		fmt.Println("TickHub v0.2.0 (Phase 3: Massive WS & TickHub Relay)")
 	case "help", "-h", "--help":
 		printUsage()
 		os.Exit(0)
@@ -58,9 +64,12 @@ func main() {
 func printUsage() {
 	fmt.Println("Usage: tickhub <command> [options]")
 	fmt.Println("\nCommands:")
-	fmt.Println("  replay    Stream historical Parquet ticks into SHM with lossless backpressure")
-	fmt.Println("  worker    Run persistent DataLoader worker daemon listening on SHM control line")
-	fmt.Println("  version   Print TickHub version")
+	fmt.Println("  daemon        Stream live market data from Massive.com WebSocket into SHM")
+	fmt.Println("  relay-server  Stream SHM frames and snapshots over TCP binary protocol")
+	fmt.Println("  relay-client  Receive binary TCP stream and replicate into local SHM")
+	fmt.Println("  replay        Stream historical Parquet ticks into SHM with lossless backpressure")
+	fmt.Println("  worker        Run persistent DataLoader worker daemon listening on SHM control line")
+	fmt.Println("  version       Print TickHub version")
 }
 
 func runReplay(args []string) {
@@ -68,6 +77,7 @@ func runReplay(args []string) {
 	configPath := fs.String("config", "examples/config_datalake.yaml", "Path to config.yaml")
 	datalakeDir := fs.String("datalake", "/mnt/wc/datalake", "Root datalake directory")
 	dateStr := fs.String("date", "2026-05-06", "Date partition (YYYY-MM-DD)")
+	shmNameOverride := fs.String("shm-name", "", "Optional SHM segment name override")
 	maxTicks := fs.Int64("max-ticks", 0, "Stop after N ticks (0 = process all)")
 	noUnlink := fs.Bool("no-unlink", false, "Do not unlink SHM segment on exit (keep resident in /dev/shm)")
 	fs.Parse(args)
@@ -133,8 +143,13 @@ func runReplay(args []string) {
 		}
 	}
 
+	shmName := rawCfg.SHM.Name
+	if *shmNameOverride != "" {
+		shmName = *shmNameOverride
+	}
+
 	shmCfg := shm.Config{
-		Name:            rawCfg.SHM.Name,
+		Name:            shmName,
 		MaxFrames:       rawCfg.SHM.MaxFrames,
 		CadenceInterval: time.Duration(rawCfg.SHM.CadenceInterval) * time.Nanosecond,
 		UniqueSymbols:   rawCfg.UniqueSymbols,
