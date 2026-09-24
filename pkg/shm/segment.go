@@ -129,6 +129,11 @@ func (s *Segment) Bytes() []byte {
 	return s.data
 }
 
+// Size returns the total mapped size in bytes.
+func (s *Segment) Size() int64 {
+	return s.size
+}
+
 // Close unmaps the memory and closes the file descriptor.
 func (s *Segment) Close(unlink bool) error {
 	var errs []string

@@ -2,6 +2,9 @@ package project
 
 import (
 	"math"
+	"time"
+
+	"github.com/benwulfe-fb/tickhub/pkg/shm"
 )
 
 const maxHistoryBars = 32
@@ -99,4 +102,67 @@ func (h *SymbolHistory) CloseBar(slot int) (logRet1s, logRet5s, logRet15s, vol1s
 	}
 
 	return logRet1s, logRet5s, logRet15s, vol1s, spreadBps
+}
+
+// SeedFromBars reconstructs past bar prices backwards from chronological past bars and current price.
+func (h *SymbolHistory) SeedFromBars(lastPx, lastBid, lastAsk float64, bars []shm.FrameBar, cadenceNS int64) {
+	if len(bars) == 0 {
+		return
+	}
+	if cadenceNS <= 0 {
+		cadenceNS = int64(time.Second)
+	}
+	if lastPx <= 0 {
+		lastPx = 100.0
+	}
+	h.lastPrice = lastPx
+	if lastBid > 0 {
+		h.lastBid = lastBid
+	}
+	if lastAsk > 0 {
+		h.lastAsk = lastAsk
+	}
+	h.hasTraded = true
+	h.initialized = true
+
+	px := lastPx
+	for i := len(bars) - 1; i >= 0; i-- {
+		slot := int(bars[i].AnchorNS / cadenceNS)
+		s := (slot%maxHistoryBars + maxHistoryBars) % maxHistoryBars
+		h.prices[s] = px
+		if len(bars[i].Features) > 3 {
+			h.volumes[s] = bars[i].Features[3]
+		}
+		if len(bars[i].Features) > 0 {
+			r1 := bars[i].Features[0]
+			px = px * math.Exp(-r1)
+		}
+	}
+}
+
+// SeedPrevailingPrice initializes baseline price and quote state without stitching past return history.
+func (h *SymbolHistory) SeedPrevailingPrice(lastPx, lastBid, lastAsk float64) {
+	if lastPx <= 0 {
+		if lastBid > 0 && lastAsk > 0 {
+			lastPx = (lastBid + lastAsk) / 2.0
+		} else if lastBid > 0 {
+			lastPx = lastBid
+		} else if lastAsk > 0 {
+			lastPx = lastAsk
+		} else {
+			lastPx = 100.0
+		}
+	}
+	h.lastPrice = lastPx
+	if lastBid > 0 {
+		h.lastBid = lastBid
+	}
+	if lastAsk > 0 {
+		h.lastAsk = lastAsk
+	}
+	h.hasTraded = true
+	h.initialized = true
+	for i := 0; i < maxHistoryBars; i++ {
+		h.prices[i] = lastPx
+	}
 }

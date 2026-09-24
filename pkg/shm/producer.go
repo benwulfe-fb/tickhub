@@ -1,6 +1,8 @@
 package shm
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -30,6 +32,7 @@ type Config struct {
 	Permissions     uint32
 	UnlinkOnExit    bool
 	Mode            uint32 // ModeLiveStreaming (0) or ModeHistoricalReplay (1)
+	AllowRecovery   bool   // Attempt warm/resident recovery if segment is present
 }
 
 var (
@@ -48,6 +51,8 @@ type Producer struct {
 	symbolMap     map[string]int // symbol name -> directory index
 	phaseSymMap   []map[string]int // phase index -> (symbol name -> phase symbol index)
 	firstAnchorNS int64
+	downtimeNS    int64
+	missedAnchors uint64
 }
 
 // CreateProducer calculates memory requirements, allocates the segment, formats headers,
@@ -113,6 +118,9 @@ func CreateProducer(cfg Config) (*Producer, error) {
 	header.DaemonPID = int64(os.Getpid())
 	header.HeartbeatNS = time.Now().UnixNano()
 	header.Phases = phaseInfos
+	header.BootID = generateBootID()
+	header.Generation = 1
+	header.RecoveryMode = RecoveryModeColdStart
 
 	// Format Symbol Directory and Unique Snapshots
 	raw := seg.Bytes()
@@ -154,9 +162,155 @@ func CreateProducer(cfg Config) (*Producer, error) {
 	}, nil
 }
 
+func generateBootID() uint64 {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	id := binary.LittleEndian.Uint64(b[:])
+	if id == 0 {
+		id = uint64(time.Now().UnixNano())
+	}
+	return id
+}
+
+// CreateProducerWithRecovery checks if an existing segment can be re-attached for warm or gap recovery.
+// Returns the Producer, the determined recovery mode (ColdStart, WarmSubCadence, WarmResidentGap), and error.
+func CreateProducerWithRecovery(cfg Config) (*Producer, uint32, error) {
+	if !cfg.AllowRecovery {
+		p, err := CreateProducer(cfg)
+		return p, RecoveryModeColdStart, err
+	}
+
+	if cfg.MaxFrames == 0 || (cfg.MaxFrames&(cfg.MaxFrames-1)) != 0 {
+		return nil, RecoveryModeColdStart, fmt.Errorf("max_frames must be a power of 2 (got %d)", cfg.MaxFrames)
+	}
+	if len(cfg.Phases) == 0 || len(cfg.Phases) > MaxPhases {
+		return nil, RecoveryModeColdStart, fmt.Errorf("number of phases must be between 1 and %d (got %d)", MaxPhases, len(cfg.Phases))
+	}
+	if len(cfg.UniqueSymbols) > MaxSnapshotSymbols {
+		return nil, RecoveryModeColdStart, fmt.Errorf("unique symbols (%d) exceed max snapshot capacity (%d)", len(cfg.UniqueSymbols), MaxSnapshotSymbols)
+	}
+
+	numFeatures := uint32(len(cfg.Features))
+	currentOffset := DataAreaOffset
+
+	phaseOffsets := make([]uintptr, len(cfg.Phases))
+	phaseStrides := make([]uintptr, len(cfg.Phases))
+
+	for i, p := range cfg.Phases {
+		nSym := uint32(len(p.Symbols))
+		frameSize := uintptr(64 + nSym*8 + nSym*numFeatures*8)
+		frameStride := (frameSize + 63) &^ 63
+		ringSize := uintptr(cfg.MaxFrames) * frameStride
+
+		phaseOffsets[i] = currentOffset
+		phaseStrides[i] = frameStride
+		currentOffset += ringSize
+	}
+
+	totalSize := int64(currentOffset)
+
+	seg, err := AttachSegment(cfg.Name, false)
+	if err == nil {
+		hdr := seg.Header()
+		featuresMatch := true
+		for pIdx := range cfg.Phases {
+			if hdr.Phases[pIdx].NumFeatures != numFeatures {
+				featuresMatch = false
+				break
+			}
+		}
+
+		if seg.Size() == totalSize &&
+			hdr.Magic == MagicBytes &&
+			hdr.Version == CurrentABIVersion &&
+			hdr.MaxFrames == cfg.MaxFrames &&
+			hdr.NumPhases == uint32(len(cfg.Phases)) &&
+			hdr.TotalSymbols == uint32(len(cfg.UniqueSymbols)) &&
+			featuresMatch {
+
+			lastAnchor := atomic.LoadInt64(&hdr.LastWrittenAnchorNS)
+			now := time.Now().UnixNano()
+			downtime := now - lastAnchor
+			cadence := int64(cfg.CadenceInterval)
+			if cadence <= 0 {
+				cadence = int64(time.Second)
+			}
+			maxRingNS := int64(cfg.MaxFrames) * cadence
+
+			if lastAnchor > 0 && downtime > 0 && downtime < maxRingNS {
+				// Eligible for resident recovery!
+				// Step A: Atomic Quarantine
+				atomic.StoreUint32(&hdr.Status, StatusBooting)
+
+				var recMode uint32
+				if downtime < cadence {
+					recMode = RecoveryModeWarmSubCadence
+				} else {
+					recMode = RecoveryModeWarmResidentGap
+				}
+
+				raw := seg.Bytes()
+				symMap := make(map[string]int)
+				snapshots := make([]*SymbolSnapshot, len(cfg.UniqueSymbols))
+				for i, s := range cfg.UniqueSymbols {
+					symMap[s] = i
+					snapPtr := (*SymbolSnapshot)(unsafe.Pointer(&raw[SnapshotOffset+uintptr(i*128)]))
+					snapshots[i] = snapPtr
+				}
+
+				phaseSymMap := make([]map[string]int, len(cfg.Phases))
+				for i, p := range cfg.Phases {
+					m := make(map[string]int)
+					for sIdx, s := range p.Symbols {
+						m[s] = sIdx
+					}
+					phaseSymMap[i] = m
+				}
+
+				// Step C: Atomic Metadata Publishing
+				atomic.AddUint32(&hdr.Generation, 1)
+				atomic.StoreUint32(&hdr.RecoveryMode, recMode)
+				atomic.StoreInt64(&hdr.DaemonPID, int64(os.Getpid()))
+				atomic.StoreInt64(&hdr.HeartbeatNS, now)
+				newBootID := generateBootID()
+				atomic.StoreUint64(&hdr.BootID, newBootID)
+
+				prod := &Producer{
+					cfg:           cfg,
+					segment:       seg,
+					header:        hdr,
+					snapshots:     snapshots,
+					phaseOffsets:  phaseOffsets,
+					phaseStrides:  phaseStrides,
+					symbolMap:     symMap,
+					phaseSymMap:   phaseSymMap,
+					downtimeNS:    downtime,
+					missedAnchors: uint64(downtime / cadence),
+				}
+				return prod, recMode, nil
+			}
+		}
+		_ = seg.Close(false)
+	}
+
+	// Fallback to cold start creation
+	p, err := CreateProducer(cfg)
+	return p, RecoveryModeColdStart, err
+}
+
 // SetStatus updates daemon operational state.
 func (p *Producer) SetStatus(status uint32) {
 	atomic.StoreUint32(&p.header.Status, status)
+}
+
+// DowntimeNS returns estimated downtime nanoseconds if recovered from resident segment.
+func (p *Producer) DowntimeNS() int64 {
+	return p.downtimeNS
+}
+
+// MissedAnchors returns number of anchors skipped during downtime.
+func (p *Producer) MissedAnchors() uint64 {
+	return p.missedAnchors
 }
 
 // WriteSnapshot performs a lock-free SeqLock write of top-of-book for unique symbolIdx.
@@ -290,6 +444,7 @@ func (p *Producer) CommitSymbolMetrics(phaseIdx int, symbolPhaseIdx int, anchorN
 		frameHdr.EndTimestampNS = anchorNS
 		frameHdr.NumSymbols = p.header.Phases[phaseIdx].NumSymbols
 		frameHdr.NumFeatures = p.header.Phases[phaseIdx].NumFeatures
+		atomic.StoreUint32(&frameHdr.Flags, 0)
 	}
 
 	nSym := uintptr(p.header.Phases[phaseIdx].NumSymbols)
@@ -387,9 +542,96 @@ func (p *Producer) Segment() *Segment {
 	return p.segment
 }
 
+// Snapshot returns the snapshot pointer for symbol directory index.
+func (p *Producer) Snapshot(symbolIdx int) *SymbolSnapshot {
+	if symbolIdx < 0 || symbolIdx >= len(p.snapshots) {
+		return nil
+	}
+	return p.snapshots[symbolIdx]
+}
+
+// Snapshots returns all symbol snapshots.
+func (p *Producer) Snapshots() []*SymbolSnapshot {
+	return p.snapshots
+}
+
+// SetFrameFlags sets the Flags bitfield on the FrameHeader for phaseIdx at anchorNS.
+func (p *Producer) SetFrameFlags(phaseIdx int, anchorNS int64, flags uint32) {
+	if phaseIdx < 0 || phaseIdx >= len(p.phaseOffsets) {
+		return
+	}
+	cadenceNS := int64(p.header.CadenceInterval)
+	if cadenceNS <= 0 {
+		cadenceNS = int64(time.Second)
+	}
+	slot := uint32((anchorNS / cadenceNS) & int64(p.header.MaxFrames-1))
+	frameOffset := p.phaseOffsets[phaseIdx] + uintptr(slot)*p.phaseStrides[phaseIdx]
+	raw := p.segment.Bytes()
+	frameHdr := (*FrameHeader)(unsafe.Pointer(&raw[frameOffset]))
+	atomic.StoreUint32(&frameHdr.Flags, flags)
+}
+
+// FrameBar stores an anchor timestamp and extracted features from a past frame bar.
+type FrameBar struct {
+	AnchorNS int64
+	Features []float64
+}
+
+// ReadHistoryBars extracts up to maxBars historical bars for symbolPhaseIdx in phaseIdx from the ring buffer.
+// Returned bars are ordered chronologically (oldest to newest).
+func (p *Producer) ReadHistoryBars(phaseIdx int, symbolPhaseIdx int, maxBars int) []FrameBar {
+	if phaseIdx < 0 || phaseIdx >= len(p.phaseOffsets) || maxBars <= 0 {
+		return nil
+	}
+	lastAnchor := atomic.LoadInt64(&p.header.LastWrittenAnchorNS)
+	if lastAnchor == 0 {
+		return nil
+	}
+	cadenceNS := int64(p.header.CadenceInterval)
+	if cadenceNS <= 0 {
+		cadenceNS = int64(time.Second)
+	}
+
+	nSym := uintptr(p.header.Phases[phaseIdx].NumSymbols)
+	nFeat := uintptr(p.header.Phases[phaseIdx].NumFeatures)
+	raw := p.segment.Bytes()
+
+	bars := make([]FrameBar, 0, maxBars)
+
+	for step := maxBars - 1; step >= 0; step-- {
+		anchor := lastAnchor - int64(step)*cadenceNS
+		slot := uint32((anchor / cadenceNS) & int64(p.header.MaxFrames-1))
+		frameOffset := p.phaseOffsets[phaseIdx] + uintptr(slot)*p.phaseStrides[phaseIdx]
+
+		frameHdr := (*FrameHeader)(unsafe.Pointer(&raw[frameOffset]))
+		if atomic.LoadInt64(&frameHdr.AnchorNS) != anchor {
+			continue
+		}
+
+		anchorPtr := (*int64)(unsafe.Pointer(&raw[frameOffset+64+uintptr(symbolPhaseIdx)*8]))
+		if atomic.LoadInt64(anchorPtr) != anchor {
+			continue
+		}
+
+		featOffset := frameOffset + 64 + nSym*8 + uintptr(symbolPhaseIdx)*nFeat*8
+		featSlice := unsafe.Slice((*float64)(unsafe.Pointer(&raw[featOffset])), nFeat)
+		feats := make([]float64, nFeat)
+		copy(feats, featSlice)
+
+		bars = append(bars, FrameBar{
+			AnchorNS: anchor,
+			Features: feats,
+		})
+	}
+
+	return bars
+}
 
 // Close cleanly detaches memory and unlinks if configured.
 func (p *Producer) Close() error {
-	p.SetStatus(StatusClosed)
-	return p.segment.Close(p.cfg.UnlinkOnExit)
+	if p.segment != nil && p.segment.data != nil {
+		p.SetStatus(StatusClosed)
+		return p.segment.Close(p.cfg.UnlinkOnExit)
+	}
+	return nil
 }

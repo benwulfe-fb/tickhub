@@ -17,6 +17,11 @@ func main() {
 	frames := flag.Int("frames", 10, "Number of frames to produce")
 	intervalMS := flag.Int("interval", 100, "Interval between frames in milliseconds")
 	daemonMode := flag.Bool("daemon", false, "Keep running until SIGINT/SIGTERM")
+	noUnlink := flag.Bool("no-unlink", false, "Do not unlink SHM segment on exit")
+	allowRecovery := flag.Bool("recovery", false, "Allow recovery from existing segment")
+	startFrame := flag.Int("start-frame", 0, "Initial frame index to write")
+	coldStart := flag.Bool("cold-start", false, "Flag FlagColdStart on frames")
+	baseAnchor := flag.Int64("anchor", 0, "Base anchor (0 = 1700000000, -1 = now)")
 	flag.Parse()
 
 	uniqueSymbols := []string{"SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN"}
@@ -29,7 +34,8 @@ func main() {
 		UniqueSymbols:   uniqueSymbols,
 		Features:        features,
 		Permissions:     0666,
-		UnlinkOnExit:    true,
+		UnlinkOnExit:    !*noUnlink,
+		AllowRecovery:   *allowRecovery,
 		Phases: []shm.PhaseConfig{
 			{
 				ID:       0,
@@ -46,7 +52,7 @@ func main() {
 		},
 	}
 
-	prod, err := shm.CreateProducer(cfg)
+	prod, recMode, err := shm.CreateProducerWithRecovery(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create producer: %v\n", err)
 		os.Exit(1)
@@ -55,6 +61,23 @@ func main() {
 
 	prod.SetStatus(shm.StatusRunning)
 	prod.PublishTelemetry(1_500_000, 10_000_000, 0, 1000)
+	_ = recMode
+
+	// Continuously update heartbeat in background
+	stopHB := make(chan struct{})
+	defer close(stopHB)
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				prod.PublishTelemetry(1_500_000, 10_000_000, 0, 1000)
+			case <-stopHB:
+				return
+			}
+		}
+	}()
 
 	// Write snapshots for all symbols
 	for i, sym := range uniqueSymbols {
@@ -78,7 +101,12 @@ func main() {
 		_ = sym
 	}
 
-	startAnchor := int64(1700000000_000_000_000)
+	var startAnchor int64 = 1700000000_000_000_000
+	if *baseAnchor == -1 {
+		startAnchor = (time.Now().UnixNano() / 1_000_000_000) * 1_000_000_000 - int64(*frames)*1_000_000_000
+	} else if *baseAnchor > 0 {
+		startAnchor = *baseAnchor
+	}
 
 	// Produce frames
 	writeFrame := func(f int) {
@@ -111,8 +139,12 @@ func main() {
 		prod.CommitFrameFinalize(anchorP1)
 	}
 
-	for f := 0; f < *frames; f++ {
+	for f := *startFrame; f < *startFrame+*frames; f++ {
 		writeFrame(f)
+		if *coldStart {
+			anchorP0 := startAnchor + int64(f)*1_000_000_000
+			prod.SetFrameFlags(0, anchorP0, shm.FlagColdStart)
+		}
 		if *intervalMS > 0 {
 			time.Sleep(time.Duration(*intervalMS) * time.Millisecond)
 		}

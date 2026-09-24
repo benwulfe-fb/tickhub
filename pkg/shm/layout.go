@@ -26,6 +26,14 @@ const (
 	ModeLiveStreaming   uint32 = 0
 	ModeHistoricalReplay uint32 = 1
 
+	// Recovery modes (Producer -> Consumer)
+	RecoveryModeColdStart       uint32 = 0
+	RecoveryModeWarmSubCadence  uint32 = 1
+	RecoveryModeWarmResidentGap uint32 = 2
+
+	// Frame flags
+	FlagColdStart uint32 = 0x01
+
 	// Control Line Commands (Consumer -> Producer)
 	CmdIdle        uint32 = 0
 	CmdReplayChunk uint32 = 1
@@ -69,7 +77,10 @@ type GlobalHeader struct {
 	LastWrittenAnchorNS   int64
 	DroppedTickCount      uint64
 	TotalTickCount        uint64
-	_padProducer          [24]byte
+	BootID                uint64
+	Generation            uint32
+	RecoveryMode          uint32
+	_padProducer          [8]byte
 
 	// Consumer Cache Line (Aligned to 64 bytes at offset 0x0080)
 	LastReadAnchorNS  int64
@@ -160,5 +171,14 @@ var (
 	_ [128]byte  = [unsafe.Sizeof(SymbolSnapshot{})]byte{}
 	_ [64]byte   = [unsafe.Sizeof(FrameHeader{})]byte{}
 	_ [32]byte   = [unsafe.Sizeof(PhaseInfo{})]byte{}
+
+	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.AnchorPublishLatencyNS)-64]
+	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.BootID)-104]
+	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.Generation)-112]
+	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.RecoveryMode)-116]
+	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.LastReadAnchorNS)-128]
+	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.Phases)-192]
+	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.ControlReq)-448]
+	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.ControlResp)-512]
 )
 

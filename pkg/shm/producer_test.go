@@ -178,3 +178,110 @@ func TestReplayFlowControlBackpressure(t *testing.T) {
 	}
 }
 
+func TestProducerWarmAndGapRecovery(t *testing.T) {
+	segName := "test_recovery_unit"
+	_ = shmPath(segName)
+
+	cfg := Config{
+		Name:      segName,
+		MaxFrames: 16,
+		Phases: []PhaseConfig{
+			{
+				ID:       0,
+				Name:     "phase_0ms",
+				OffsetMS: 0,
+				Symbols:  []string{"AAPL"},
+			},
+		},
+		UniqueSymbols:   []string{"AAPL"},
+		Features:        []string{"ret1s", "ret5s"},
+		CadenceInterval: 1 * time.Second,
+		UnlinkOnExit:    false,
+		AllowRecovery:   true,
+	}
+
+	// 1. Initial creation (Cold Start)
+	prod1, recMode1, err := CreateProducerWithRecovery(cfg)
+	if err != nil {
+		t.Fatalf("CreateProducerWithRecovery 1 failed: %v", err)
+	}
+	if recMode1 != RecoveryModeColdStart {
+		t.Fatalf("expected ColdStart, got %d", recMode1)
+	}
+	bootID1 := prod1.header.BootID
+	if bootID1 == 0 {
+		t.Fatalf("expected non-zero BootID")
+	}
+	if prod1.header.Generation != 1 {
+		t.Fatalf("expected Generation 1, got %d", prod1.header.Generation)
+	}
+
+	// Write 5 bars ending right now
+	now := time.Now().UnixNano()
+	lastBarAnchor := (now / 1_000_000_000) * 1_000_000_000
+	baseAnchor := lastBarAnchor - 4*1_000_000_000
+	for i := 0; i < 5; i++ {
+		anchor := baseAnchor + int64(i)*1_000_000_000
+		feats := []float64{float64(i) * 0.01, float64(i) * 0.05}
+		if err := prod1.CommitSymbolMetrics(0, 0, anchor, feats); err != nil {
+			t.Fatalf("CommitSymbolMetrics failed: %v", err)
+		}
+		prod1.CommitFrameFinalize(anchor)
+	}
+
+	// Test SetFrameFlags
+	prod1.SetFrameFlags(0, lastBarAnchor, FlagColdStart)
+
+	// Test ReadHistoryBars
+	bars := prod1.ReadHistoryBars(0, 0, 5)
+	if len(bars) != 5 {
+		t.Fatalf("expected 5 history bars, got %d", len(bars))
+	}
+	if bars[4].Features[0] != 0.04 {
+		t.Fatalf("expected bar 4 feature 0 to be 0.04, got %f", bars[4].Features[0])
+	}
+
+	prod1.segment.Close(false) // leave SHM resident
+
+	// 2. Re-attach (WarmSubCadence: elapsed time is < 1s)
+	prod2, recMode2, err := CreateProducerWithRecovery(cfg)
+	if err != nil {
+		t.Fatalf("CreateProducerWithRecovery 2 failed: %v", err)
+	}
+
+	if recMode2 != RecoveryModeWarmSubCadence {
+		t.Fatalf("expected RecoveryModeWarmSubCadence, got %d", recMode2)
+	}
+	if prod2.header.Generation != 2 {
+		t.Fatalf("expected Generation 2, got %d", prod2.header.Generation)
+	}
+	if prod2.header.BootID == bootID1 {
+		t.Fatalf("expected new BootID after restart")
+	}
+
+	// History bars still readable on recovered producer
+	bars2 := prod2.ReadHistoryBars(0, 0, 5)
+	if len(bars2) != 5 {
+		t.Fatalf("expected 5 history bars after recovery, got %d", len(bars2))
+	}
+
+	// 3. Simulate Gap restart (5s downtime: artificially push lastWrittenAnchor back by 5s)
+	oldAnchor := lastBarAnchor - 5*1_000_000_000
+	atomic.StoreInt64(&prod2.header.LastWrittenAnchorNS, oldAnchor)
+	prod2.segment.Close(false)
+
+	prod3, recMode3, err := CreateProducerWithRecovery(cfg)
+	if err != nil {
+		t.Fatalf("CreateProducerWithRecovery 3 failed: %v", err)
+	}
+	defer prod3.segment.Close(true)
+
+	if recMode3 != RecoveryModeWarmResidentGap {
+		t.Fatalf("expected RecoveryModeWarmResidentGap, got %d", recMode3)
+	}
+	if prod3.header.Generation != 3 {
+		t.Fatalf("expected Generation 3, got %d", prod3.header.Generation)
+	}
+}
+
+

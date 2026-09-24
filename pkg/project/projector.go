@@ -28,9 +28,10 @@ type Projector struct {
 
 	featBuffer []float64
 
-	firstCommittedAnchor int64
-	lastCommittedAnchor  int64
-	totalCommittedFrames int
+	firstCommittedAnchor   int64
+	lastCommittedAnchor    int64
+	totalCommittedFrames   int
+	coldStartBarsRemaining int
 }
 
 type phaseRef struct {
@@ -103,6 +104,74 @@ func (p *Projector) SeedState(symbol string, lastBid, lastAsk, lastPrice float64
 		}
 	}
 }
+
+// SetColdStart configures whether rolling return queues are in warmup.
+// When cold is true, exactly 15 bars will be committed with FlagColdStart.
+func (p *Projector) SetColdStart(cold bool) {
+	if cold {
+		p.coldStartBarsRemaining = 15
+	} else {
+		p.coldStartBarsRemaining = 0
+	}
+}
+
+// IsColdStart returns true if rolling return queues are currently in warmup.
+func (p *Projector) IsColdStart() bool {
+	return p.coldStartBarsRemaining > 0
+}
+
+// SeedHistory populates rolling return history for phaseIdx and symbolPhaseIdx from pre-existing frame bars.
+func (p *Projector) SeedHistory(phaseIdx int, symbolPhaseIdx int, bars []shm.FrameBar) {
+	if phaseIdx < 0 || phaseIdx >= len(p.phases) || symbolPhaseIdx < 0 || len(bars) == 0 {
+		return
+	}
+	pCfg := p.phases[phaseIdx]
+	if symbolPhaseIdx >= len(pCfg.Symbols) {
+		return
+	}
+	sym := pCfg.Symbols[symbolPhaseIdx]
+	hist := p.histories[phaseIdx][symbolPhaseIdx]
+
+	uIdx, ok := p.symToUnique[sym]
+	var lastPx, lastBid, lastAsk float64
+	if ok && p.producer != nil {
+		snap := p.producer.Snapshot(uIdx)
+		if snap != nil {
+			if snap.LastTradePx > 0 {
+				lastPx = snap.LastTradePx
+			} else if snap.Midprice > 0 {
+				lastPx = snap.Midprice
+			}
+			lastBid = snap.BidPx
+			lastAsk = snap.AskPx
+		}
+	}
+
+	hist.SeedFromBars(lastPx, lastBid, lastAsk, bars, p.cadenceNS)
+
+	lastAnchor := bars[len(bars)-1].AnchorNS
+	nextAnchor := lastAnchor + p.cadenceNS
+	if nextAnchor > p.phaseNextAnchor[phaseIdx] {
+		p.phaseNextAnchor[phaseIdx] = nextAnchor
+		p.phaseSlots[phaseIdx] = int(nextAnchor / p.cadenceNS)
+	}
+	if p.firstCommittedAnchor == 0 || bars[0].AnchorNS < p.firstCommittedAnchor {
+		p.firstCommittedAnchor = bars[0].AnchorNS
+	}
+	if lastAnchor > p.lastCommittedAnchor {
+		p.lastCommittedAnchor = lastAnchor
+	}
+}
+
+// SeedPrevailingPrice initializes baseline price and quote state across all phases containing this symbol.
+func (p *Projector) SeedPrevailingPrice(symbol string, lastPx, lastBid, lastAsk float64) {
+	refs := p.symbolPhaseRefs[symbol]
+	for _, ref := range refs {
+		hist := p.histories[ref.phaseIdx][ref.symbolPhaseIdx]
+		hist.SeedPrevailingPrice(lastPx, lastBid, lastAsk)
+	}
+}
+
 
 // IngestTick processes a market tick and commits completed 1Hz frames when time boundaries are crossed.
 func (p *Projector) IngestTick(tick feed.Tick) error {
@@ -185,12 +254,20 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 		}
 	}
 
+	if p.coldStartBarsRemaining > 0 {
+		p.producer.SetFrameFlags(pIdx, anchorNS, shm.FlagColdStart)
+	}
+
 	p.producer.CommitFrameFinalize(anchorNS)
 	if p.firstCommittedAnchor == 0 {
 		p.firstCommittedAnchor = anchorNS
 	}
 	p.lastCommittedAnchor = anchorNS
 	p.totalCommittedFrames++
+
+	if pIdx == len(p.phases)-1 && p.coldStartBarsRemaining > 0 {
+		p.coldStartBarsRemaining--
+	}
 	return nil
 }
 

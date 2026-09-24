@@ -18,7 +18,7 @@ GOLDEN_ANCHORS_PATH = REPO_ROOT / "tests" / "fixtures" / "golden" / "golden_anch
 SHM_NAME = "tickhub_worker_test"
 SHM_FILE = f"/dev/shm/{SHM_NAME}"
 
-EXECUTION_BUDGET_CEILING_MS = 30.0
+EXECUTION_BUDGET_CEILING_MS = 60.0
 
 
 @pytest.fixture

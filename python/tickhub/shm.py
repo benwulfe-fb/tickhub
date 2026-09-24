@@ -19,6 +19,10 @@ from .abi import (
     MODE_HISTORICAL_REPLAY,
     MODE_LIVE_STREAMING,
     SNAPSHOT_OFFSET,
+    FLAG_COLD_START,
+    RECOVERY_MODE_COLD_START,
+    RECOVERY_MODE_WARM_SUB_CADENCE,
+    RECOVERY_MODE_WARM_RESIDENT_GAP,
     CMD_IDLE,
     CMD_REPLAY_CHUNK,
     CMD_SHUTDOWN,
@@ -36,6 +40,11 @@ from .abi import (
     SymbolSnapshot,
 )
 from .atomic import cpu_pause, load_acquire_i64, thread_fence_acquire, thread_fence_release
+
+
+class HeartbeatTimeoutError(Exception):
+    """Raised when the TickHub daemon heartbeat has stalled > 3.0s."""
+    pass
 
 
 class LaggedAnchorError(Exception):
@@ -245,6 +254,89 @@ class TickHubReader:
 
         # Base pointer address for raw atomic loads
         self._base_addr = ctypes.cast(ctypes.c_char_p(ctypes.addressof(self._header)), ctypes.c_void_p).value
+        self._boot_id = self._header.boot_id
+        self._generation = self._header.generation
+        self._auto_realign = bool(self.config.get("auto_realign", False))
+
+    @property
+    def boot_id(self) -> int:
+        """UUID of the currently running TickHub daemon."""
+        return self._header.boot_id
+
+    @property
+    def generation(self) -> int:
+        """SHM segment generation sequence number."""
+        return self._header.generation
+
+    @property
+    def recovery_mode(self) -> int:
+        """Recovery mode (0=Cold, 1=WarmSubCadence, 2=WarmResidentGap)."""
+        return self._header.recovery_mode
+
+    @property
+    def is_warm_recovered(self) -> bool:
+        """True if the daemon recovered from resident SHM."""
+        return self.recovery_mode in (RECOVERY_MODE_WARM_SUB_CADENCE, RECOVERY_MODE_WARM_RESIDENT_GAP)
+
+    def get_frame_flags(self, phase_idx: int, anchor_ns: int) -> int:
+        """Reads the FrameHeader.flags bitfield for phase_idx at anchor_ns."""
+        p_info = self._phase_infos[phase_idx]
+        slot = (anchor_ns // self.cadence_ns) & (self.max_frames - 1)
+        frame_offset = p_info.ring_offset_bytes + slot * p_info.frame_stride_bytes
+        frame_hdr = FrameHeader.from_address(self._base_addr + frame_offset)
+        return frame_hdr.flags
+
+    @property
+    def is_cold_start(self) -> bool:
+        """True if the latest frame has FlagColdStart set."""
+        latest = self.last_written_anchor_ns
+        if latest == 0:
+            return True
+        p_info = self._phase_infos[0]
+        offset_ns = p_info.offset_ms * 1_000_000
+        phase0_anchor = ((latest - offset_ns) // self.cadence_ns) * self.cadence_ns + offset_ns
+        return bool(self.get_frame_flags(0, phase0_anchor) & FLAG_COLD_START)
+
+    def reconnect_if_needed(self, cursors: Optional[list[SymbolCursor]] = None) -> bool:
+        """Monitors daemon liveness, BootID changes, and handles transparent recovery."""
+        if self._header is None:
+            return False
+
+        # 1. Heartbeat freshness check
+        hb = self._header.heartbeat_ns
+        now_ns = time.time_ns()
+        if hb > 0 and (now_ns - hb) > 3_000_000_000:
+            raise HeartbeatTimeoutError(f"TickHub daemon heartbeat stalled > 3.0s (age: {(now_ns - hb)/1e9:.2f}s)")
+
+        # 2. StatusBooting backoff
+        if self._header.status == 1:  # STATUS_BOOTING
+            start_wait = time.time_ns()
+            while self._header.status == 1:
+                if time.time_ns() - start_wait > 2_000_000_000:
+                    break
+                time.sleep(0.01)
+
+        # 3. BootID restart detection
+        curr_boot = self._header.boot_id
+        if curr_boot != 0 and curr_boot != self._boot_id:
+            self._boot_id = curr_boot
+            self._generation = self._header.generation
+            rec_mode = self._header.recovery_mode
+            latest_anchor = self.last_written_anchor_ns
+
+            if cursors and latest_anchor > 0:
+                for c in cursors:
+                    p_info = self._phase_infos[c.phase_idx]
+                    offset_ns = p_info.offset_ms * 1_000_000
+                    phase_latest = ((latest_anchor - offset_ns) // self.cadence_ns) * self.cadence_ns + offset_ns
+                    oldest_valid = phase_latest - int(self.max_frames - 1) * self.cadence_ns
+
+                    if rec_mode in (RECOVERY_MODE_COLD_START, RECOVERY_MODE_WARM_RESIDENT_GAP):
+                        c.target_anchor_ns = phase_latest
+                    elif c.target_anchor_ns < oldest_valid:
+                        c.target_anchor_ns = phase_latest
+            return True
+        return False
 
     @property
     def anchor_publish_latency_ns(self) -> int:
@@ -490,6 +582,9 @@ class TickHubReader:
         failed_symbols: list[str] = []
         timeout_ns = int(timeout_ms * 1_000_000)
 
+        # Check for daemon restart or heartbeat stall
+        self.reconnect_if_needed(cursors)
+
         # Process cursors
         for out_idx, cursor in enumerate(cursors):
             p_info = self._phase_infos[cursor.phase_idx]
@@ -499,9 +594,17 @@ class TickHubReader:
 
             # Check for ring buffer lag (overwritten frame)
             last_written = self.last_written_anchor_ns
-            oldest_valid = last_written - int(self.max_frames - 1) * self.cadence_ns
+            offset_ns = p_info.offset_ms * 1_000_000
+            phase_latest = ((last_written - offset_ns) // self.cadence_ns) * self.cadence_ns + offset_ns
+            oldest_valid = phase_latest - int(self.max_frames - 1) * self.cadence_ns
             if not self.is_replay_mode and target_anchor < oldest_valid and last_written > 0:
-                raise LaggedAnchorError(cursor.symbol, cursor.phase, target_anchor, last_written)
+                if self._auto_realign:
+                    target_anchor = phase_latest
+                    cursor.target_anchor_ns = phase_latest
+                    slot = (target_anchor // self.cadence_ns) & (self.max_frames - 1)
+                    frame_offset = p_info.ring_offset_bytes + slot * p_info.frame_stride_bytes
+                else:
+                    raise LaggedAnchorError(cursor.symbol, cursor.phase, target_anchor, last_written)
 
             # Symbol anchor address
             anchor_addr = self._base_addr + frame_offset + 64 + cursor.symbol_idx * 8
@@ -516,6 +619,13 @@ class TickHubReader:
                     break
                 if loaded_anchor > target_anchor:
                     if not self.is_replay_mode:
+                        if self._auto_realign:
+                            target_anchor = loaded_anchor
+                            cursor.target_anchor_ns = loaded_anchor
+                            slot = (target_anchor // self.cadence_ns) & (self.max_frames - 1)
+                            frame_offset = p_info.ring_offset_bytes + slot * p_info.frame_stride_bytes
+                            anchor_addr = self._base_addr + frame_offset + 64 + cursor.symbol_idx * 8
+                            continue
                         # Slot was already overwritten by future anchor
                         raise LaggedAnchorError(cursor.symbol, cursor.phase, target_anchor, loaded_anchor)
                     else:
@@ -625,6 +735,7 @@ class TickHubReader:
         timeout_ns = int(timeout_s * 1_000_000_000)
         t0 = time.time_ns()
 
+        spin_count = 0
         while True:
             if resp.response_id == req_id:
                 status = resp.status
@@ -640,7 +751,9 @@ class TickHubReader:
                 raise TimeoutError(f"Timed out after {timeout_s}s waiting for chunk response for {symbol} {date_str}")
 
             cpu_pause()
-            time.sleep(0.0001)
+            spin_count += 1
+            if spin_count > 200:
+                time.sleep(0.0001)
 
     def shutdown_worker(self) -> None:
         """Sends CmdShutdown to worker daemon."""

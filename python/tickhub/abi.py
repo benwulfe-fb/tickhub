@@ -21,6 +21,12 @@ STATUS_CLOSED = 4
 MODE_LIVE_STREAMING = 0
 MODE_HISTORICAL_REPLAY = 1
 
+RECOVERY_MODE_COLD_START = 0
+RECOVERY_MODE_WARM_SUB_CADENCE = 1
+RECOVERY_MODE_WARM_RESIDENT_GAP = 2
+
+FLAG_COLD_START = 0x01
+
 CMD_IDLE = 0
 CMD_REPLAY_CHUNK = 1
 CMD_SHUTDOWN = 2
@@ -86,7 +92,10 @@ class GlobalHeader(ctypes.Structure):
         ("last_written_anchor_ns", ctypes.c_int64),
         ("dropped_tick_count", ctypes.c_uint64),
         ("total_tick_count", ctypes.c_uint64),
-        ("_pad_producer", ctypes.c_uint8 * 24),
+        ("boot_id", ctypes.c_uint64),
+        ("generation", ctypes.c_uint32),
+        ("recovery_mode", ctypes.c_uint32),
+        ("_pad_producer", ctypes.c_uint8 * 8),
         ("last_read_anchor_ns", ctypes.c_int64),
         ("consumer_pid", ctypes.c_int64),
         ("consumer_heartbeat", ctypes.c_int64),
@@ -151,6 +160,9 @@ assert ctypes.sizeof(FrameHeader) == 64, f"FrameHeader size mismatch: {ctypes.si
 
 # Cache line alignment checks
 assert GlobalHeader.anchor_publish_latency_ns.offset == 64, f"Producer line misaligned: {GlobalHeader.anchor_publish_latency_ns.offset}"
+assert GlobalHeader.boot_id.offset == 104, f"boot_id misaligned: {GlobalHeader.boot_id.offset}"
+assert GlobalHeader.generation.offset == 112, f"generation misaligned: {GlobalHeader.generation.offset}"
+assert GlobalHeader.recovery_mode.offset == 116, f"recovery_mode misaligned: {GlobalHeader.recovery_mode.offset}"
 assert GlobalHeader.last_read_anchor_ns.offset == 128, f"Consumer line misaligned: {GlobalHeader.last_read_anchor_ns.offset}"
 assert GlobalHeader.phases.offset == 192, f"Phases array misaligned: {GlobalHeader.phases.offset}"
 assert GlobalHeader.control_req.offset == 448, f"control_req misaligned: {GlobalHeader.control_req.offset}"
