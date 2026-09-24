@@ -189,3 +189,25 @@ def test_lagged_anchor_error_and_rebegin(producer_process):
         # Call rebegin on the lagged cursor
         p0_cursors[0].rebegin()
         assert p0_cursors[0].target_anchor_ns > 1700000000_000_000_000
+
+
+def test_standalone_reader_from_shm_path(producer_process):
+    # Connect directly via POSIX SHM path with no config dictionary or yaml file
+    shm_path = f"/dev/shm/{SHM_NAME}"
+    with TickHubReader(shm_path) as hub:
+        assert len(hub.symbols) > 0
+        assert "SPY" in hub.symbols
+        assert hub.heartbeat_ns > 0
+        snap = hub.snapshot("SPY")
+        assert snap["symbol"] == "SPY"
+        assert snap["bid_px"] > 0
+
+    # Conflicting shm_path_override must raise ValueError
+    with pytest.raises(ValueError, match="Conflicting shm_path_override"):
+        TickHubReader(shm_path, shm_path_override="/dev/shm/different_shm")
+
+    # Nonexistent SHM path must raise FileNotFoundError
+    with pytest.raises(FileNotFoundError):
+        TickHubReader("/dev/shm/tickhub_nonexistent_test_segment_12345")
+
+

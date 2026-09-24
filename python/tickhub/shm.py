@@ -168,16 +168,39 @@ class TickHubReader:
 
     def __init__(
         self,
-        config_path_or_dict: Union[str, Path, dict],
+        config_path_or_dict: Union[str, Path, dict, None] = None,
         shm_path_override: Optional[str] = None,
     ):
-        if isinstance(config_path_or_dict, (str, Path)):
-            with open(config_path_or_dict, "r") as f:
-                self.config = yaml.safe_load(f)
+        if config_path_or_dict is None:
+            self.config = {}
         elif isinstance(config_path_or_dict, dict):
             self.config = config_path_or_dict
+        elif isinstance(config_path_or_dict, (str, Path)):
+            p_str = str(config_path_or_dict)
+            is_shm = False
+            if p_str.startswith("/dev/shm/"):
+                is_shm = True
+            elif os.path.exists(p_str):
+                try:
+                    with open(p_str, "rb") as f:
+                        magic = f.read(8)
+                        if magic == b"TICKHUB1":
+                            is_shm = True
+                except OSError as e:
+                    raise OSError(f"Failed to inspect candidate path '{p_str}': {e}") from e
+
+            if is_shm:
+                if shm_path_override is not None and shm_path_override != p_str:
+                    raise ValueError(
+                        f"Conflicting shm_path_override '{shm_path_override}' provided with positional SHM path '{p_str}'"
+                    )
+                self.config = {}
+                shm_path_override = p_str
+            else:
+                with open(config_path_or_dict, "r") as f:
+                    self.config = yaml.safe_load(f)
         else:
-            raise TypeError("config_path_or_dict must be a file path or dict")
+            raise TypeError("config_path_or_dict must be a file path, dict, or None")
 
         # Parse SHM segment name
         shm_name = (
@@ -252,6 +275,8 @@ class TickHubReader:
             self._phase_idx_to_name[i] = p_name
 
             symbols = p_cfg.get("symbols", [])
+            if not symbols:
+                symbols = sorted(self._symbol_to_dir_idx.keys(), key=lambda s: self._symbol_to_dir_idx[s])
             self._phase_symbols[p_name] = symbols
             sym_map = {s: s_i for s_i, s in enumerate(symbols)}
             self._phase_sym_to_idx[p_name] = sym_map
@@ -363,6 +388,13 @@ class TickHubReader:
         """Watermark buffer duration in nanoseconds."""
         addr = self._base_addr + GlobalHeader.watermark_buffer_ns.offset
         return load_acquire_i64(addr)
+
+    @property
+    def heartbeat_ns(self) -> int:
+        """Daemon heartbeat in epoch nanoseconds."""
+        if self._header is None:
+            return 0
+        return self._header.heartbeat_ns
 
     @property
     def last_written_anchor_ns(self) -> int:
