@@ -3,9 +3,13 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -17,23 +21,143 @@ import (
 	"github.com/benwulfe-fb/tickhub/pkg/shm"
 )
 
+// FeedManager manages the dynamic lifecycle of the Massive.com WebSocket ingestion client.
+type FeedManager struct {
+	mu           sync.Mutex
+	enabled      bool
+	endpoint     string
+	apiKey       string
+	symbols      []string
+	client       *feed.MassiveWSClient
+	rootCtx      context.Context
+	clientCtx    context.Context
+	clientCancel context.CancelFunc
+	tickCh       chan feed.Tick
+	tickCount    atomic.Uint64
+	wg           sync.WaitGroup
+}
+
+func NewFeedManager(rootCtx context.Context, endpoint, apiKey string, symbols []string) *FeedManager {
+	if rootCtx == nil {
+		rootCtx = context.Background()
+	}
+	return &FeedManager{
+		rootCtx:  rootCtx,
+		endpoint: endpoint,
+		apiKey:   apiKey,
+		symbols:  symbols,
+		tickCh:   make(chan feed.Tick, 65536),
+	}
+}
+
+func (fm *FeedManager) FeedStatus() (enabled bool, ticks uint64) {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	return fm.enabled, fm.tickCount.Load()
+}
+
+func (fm *FeedManager) Ticks() <-chan feed.Tick {
+	return fm.tickCh
+}
+
+func (fm *FeedManager) EnableFeed(ctx context.Context) error {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	if fm.enabled {
+		return nil
+	}
+	if fm.apiKey == "" {
+		return fmt.Errorf("cannot enable feed: Massive.com API key is empty")
+	}
+
+	client := feed.NewMassiveWSClient(fm.endpoint, fm.apiKey, fm.symbols, 65536)
+	clientCtx, clientCancel := context.WithCancel(fm.rootCtx)
+	if err := client.Start(clientCtx); err != nil {
+		clientCancel()
+		return fmt.Errorf("massive ws connect: %w", err)
+	}
+
+	fm.client = client
+	fm.clientCtx = clientCtx
+	fm.clientCancel = clientCancel
+	fm.enabled = true
+
+	fm.wg.Add(1)
+	go func(c *feed.MassiveWSClient, cCtx context.Context) {
+		defer fm.wg.Done()
+		ticks := c.Ticks()
+		for {
+			select {
+			case <-cCtx.Done():
+				return
+			case tick, ok := <-ticks:
+				if !ok {
+					return
+				}
+				fm.tickCount.Add(1)
+				select {
+				case fm.tickCh <- tick:
+				case <-cCtx.Done():
+					return
+				}
+			}
+		}
+	}(client, clientCtx)
+
+	log.Printf("[FEED] Massive WS feed ENABLED for %d symbols", len(fm.symbols))
+	return nil
+}
+
+func (fm *FeedManager) DisableFeed(ctx context.Context) error {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	if !fm.enabled {
+		return nil
+	}
+	if fm.clientCancel != nil {
+		fm.clientCancel()
+		fm.clientCancel = nil
+	}
+	if fm.client != nil {
+		fm.client.Close()
+		fm.client = nil
+	}
+	fm.enabled = false
+	fm.wg.Wait()
+	log.Printf("[FEED] Massive WS feed DISABLED. Daemon running in standby mode.")
+	return nil
+}
+
+func (fm *FeedManager) Close() {
+	_ = fm.DisableFeed(context.Background())
+}
+
 func runDaemon(args []string) {
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
 	configPath := fs.String("config", "examples/config_datalake.yaml", "Path to config.yaml")
 	apiKey := fs.String("api-key", "", "Massive.com API key (default: MASSIVE_API_KEY env)")
+	apiKeyFile := fs.String("api-key-file", "", "Optional path to file containing Massive.com API key")
 	shmNameOverride := fs.String("shm-name", "", "Optional SHM segment name override (e.g. tickhub_live)")
 	wsEndpoint := fs.String("ws-endpoint", "", "Optional WebSocket endpoint override (default: wss://socket.massive.com/stocks)")
-	metricsAddr := fs.String("metrics-addr", ":9090", "HTTP server address for /metrics, /healthz, /readyz")
+	metricsAddr := fs.String("metrics-addr", DefaultMetricsBind, "HTTP server address for /metrics, /healthz, /readyz, /control/feed")
 	allowRecovery := fs.Bool("allow-recovery", true, "Attempt warm/resident recovery if SHM segment exists")
 	noUnlink := fs.Bool("no-unlink", false, "Do not unlink SHM segment on exit")
+	feedEnabled := fs.Bool("feed-enabled", false, "Enable live Massive.com WebSocket feed on boot (default false for safe standby)")
 	fs.Parse(args)
 
 	key := *apiKey
+	if key == "" && *apiKeyFile != "" {
+		if data, err := os.ReadFile(*apiKeyFile); err == nil {
+			key = strings.TrimSpace(string(data))
+		} else {
+			log.Fatalf("[DAEMON] Failed to read API key file %s: %v", *apiKeyFile, err)
+		}
+	}
 	if key == "" {
 		key = os.Getenv("MASSIVE_API_KEY")
 	}
-	if key == "" {
-		log.Fatalf("[DAEMON] Error: Massive.com API key required via --api-key or MASSIVE_API_KEY env")
+	if key == "" && *feedEnabled {
+		log.Fatalf("[DAEMON] Error: Massive.com API key required via --api-key, --api-key-file, or MASSIVE_API_KEY env")
 	}
 
 	cfgData, err := os.ReadFile(*configPath)
@@ -115,10 +239,18 @@ func runDaemon(args []string) {
 
 	prod.SetStatus(shm.StatusRunning)
 
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	feedMgr := NewFeedManager(ctx, *wsEndpoint, key, rawCfg.UniqueSymbols)
+	defer feedMgr.Close()
+
 	// Start metrics server
 	metricsSrv := metrics.NewServer(*metricsAddr, prod.Header())
 	metricsSrv.SetRecoveryStats(prod.DowntimeNS(), prod.MissedAnchors())
 	metricsSrv.SetCommittedFramesFunc(projector.CommittedFrames)
+	metricsSrv.SetFeedController(feedMgr)
+
 	if err := metricsSrv.Start(); err != nil {
 		log.Printf("[METRICS] Warning: failed to start HTTP server on %s: %v", *metricsAddr, err)
 	} else {
@@ -127,28 +259,22 @@ func runDaemon(args []string) {
 			defer stopCancel()
 			_ = metricsSrv.Stop(stopCtx)
 		}()
-		log.Printf("[METRICS] Observability server listening on %s (/metrics, /healthz, /readyz)", *metricsAddr)
+		log.Printf("[METRICS] Observability server listening on %s (/metrics, /healthz, /readyz, /control/feed)", *metricsAddr)
 	}
 
-	client := feed.NewMassiveWSClient(*wsEndpoint, key, rawCfg.UniqueSymbols, 65536)
-	defer client.Close()
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
-	log.Printf("[DAEMON] Connecting to Massive WS. Ingesting %d symbols into /dev/shm/%s (PID: %d)",
-		len(rawCfg.UniqueSymbols), shmName, os.Getpid())
-
-	if err := client.Start(ctx); err != nil {
-		log.Fatalf("[DAEMON] Connect failed: %v", err)
+	if *feedEnabled {
+		log.Printf("[DAEMON] Booting with feed enabled (--feed-enabled=true). Ingesting %d symbols into /dev/shm/%s (PID: %d)",
+			len(rawCfg.UniqueSymbols), shmName, os.Getpid())
+		if err := feedMgr.EnableFeed(ctx); err != nil {
+			log.Fatalf("[DAEMON] Initial feed connect failed: %v", err)
+		}
+	} else {
+		log.Printf("[DAEMON] Booting in STANDBY mode (--feed-enabled=false). WebSocket connection held closed. Use 'tickhub feed enable' to activate.")
 	}
-	log.Printf("[DAEMON] Authenticated to Massive WS. Subscribed to %d symbols. Streaming to /dev/shm/%s",
-		len(rawCfg.UniqueSymbols), shmName)
 
 	var tickCount uint64 = 0
 	startTime := time.Now()
 	lastReport := time.Now()
-	ticks := client.Ticks()
 
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
@@ -165,14 +291,8 @@ func runDaemon(args []string) {
 			log.Printf("[DAEMON] Shutdown requested. Halting...")
 			prod.SetStatus(shm.StatusClosed)
 			return
-		case tick, ok := <-ticks:
-			if !ok {
-				log.Printf("[DAEMON] Tick channel closed. Halting...")
-				prod.SetStatus(shm.StatusClosed)
-				return
-			}
+		case tick := <-feedMgr.Ticks():
 			tickCount++
-
 			if err := projector.IngestTick(tick); err != nil {
 				log.Printf("[DAEMON] Ingest error: %v", err)
 			}
@@ -190,8 +310,13 @@ func runDaemon(args []string) {
 			if time.Since(lastReport) >= 5*time.Second {
 				elapsed := now.Sub(startTime).Seconds()
 				rate := float64(tickCount) / elapsed
-				log.Printf("[DAEMON] Ingested %d ticks (%.1f/sec), committed %d frames",
-					tickCount, rate, projector.CommittedFrames())
+				enabled, _ := feedMgr.FeedStatus()
+				feedState := "ENABLED"
+				if !enabled {
+					feedState = "STANDBY"
+				}
+				log.Printf("[DAEMON] [%s] Ingested %d ticks (%.1f/sec), committed %d frames",
+					feedState, tickCount, rate, projector.CommittedFrames())
 				lastReport = now
 			}
 		}

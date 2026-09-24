@@ -2,16 +2,25 @@ package metrics
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/benwulfe-fb/tickhub/pkg/shm"
 )
 
-// Server provides HTTP observability endpoints (/metrics, /healthz, /readyz).
+// FeedController defines dynamic control over the market data ingestion feed.
+type FeedController interface {
+	FeedStatus() (enabled bool, ticks uint64)
+	EnableFeed(ctx context.Context) error
+	DisableFeed(ctx context.Context) error
+}
+
+// Server provides HTTP observability endpoints (/metrics, /healthz, /readyz, /control/feed).
 type Server struct {
 	addr              string
 	hdr               *shm.GlobalHeader
@@ -21,6 +30,8 @@ type Server struct {
 	downtimeNS        int64
 	missedAnchors     uint64
 	committedFramesFn func() int
+	feedCtrl          FeedController
+	feedMu            sync.RWMutex
 }
 
 // SetRecoveryStats sets downtime and missed anchors telemetry for Prometheus export.
@@ -32,6 +43,13 @@ func (s *Server) SetRecoveryStats(downtimeNS int64, missedAnchors uint64) {
 // SetCommittedFramesFunc attaches a provider function for total committed 1Hz frames.
 func (s *Server) SetCommittedFramesFunc(fn func() int) {
 	s.committedFramesFn = fn
+}
+
+// SetFeedController attaches a dynamic feed controller for runtime start/stop.
+func (s *Server) SetFeedController(fc FeedController) {
+	s.feedMu.Lock()
+	defer s.feedMu.Unlock()
+	s.feedCtrl = fc
 }
 
 // NewServer initializes an HTTP metrics and health monitoring server.
@@ -49,6 +67,7 @@ func NewServer(addr string, hdr *shm.GlobalHeader) *Server {
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/control/feed", s.handleControlFeed)
 
 	s.srv = &http.Server{
 		Addr:    addr,
@@ -212,4 +231,64 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP tickhub_recovery_missed_anchors_total Total 1Hz anchors missed during downtime\n")
 	_, _ = fmt.Fprintf(w, "# TYPE tickhub_recovery_missed_anchors_total counter\n")
 	_, _ = fmt.Fprintf(w, "tickhub_recovery_missed_anchors_total %d\n", s.missedAnchors)
+}
+
+func (s *Server) handleControlFeed(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	s.feedMu.RLock()
+	fc := s.feedCtrl
+	s.feedMu.RUnlock()
+
+	if fc == nil {
+		w.WriteHeader(http.StatusNotImplemented)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "feed controller not registered"})
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		enabled, ticks := fc.FeedStatus()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":  "ok",
+			"enabled": enabled,
+			"ticks":   ticks,
+		})
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		action := r.URL.Query().Get("action")
+		var err error
+		switch action {
+		case "enable":
+			err = fc.EnableFeed(r.Context())
+		case "disable":
+			err = fc.DisableFeed(r.Context())
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": "invalid action; expected ?action=enable or ?action=disable",
+			})
+			return
+		}
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		enabled, ticks := fc.FeedStatus()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":  "ok",
+			"action":  action,
+			"enabled": enabled,
+			"ticks":   ticks,
+		})
+		return
+	}
+
+	w.WriteHeader(http.StatusMethodNotAllowed)
 }

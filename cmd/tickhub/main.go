@@ -49,6 +49,8 @@ func main() {
 		runRelayServer(os.Args[2:])
 	case "relay-client":
 		runRelayClient(os.Args[2:])
+	case "feed":
+		runFeedCtl(os.Args[2:])
 	case "status":
 		runStatus(os.Args[2:])
 	case "version":
@@ -67,6 +69,7 @@ func printUsage() {
 	fmt.Println("Usage: tickhub <command> [options]")
 	fmt.Println("\nCommands:")
 	fmt.Println("  daemon        Stream live market data from Massive.com WebSocket into SHM")
+	fmt.Println("  feed          Manage live market data feed status, enable, or disable")
 	fmt.Println("  status        Realtime ANSI terminal status inspection for /dev/shm")
 	fmt.Println("  relay-server  Stream SHM frames and snapshots over TCP binary protocol")
 	fmt.Println("  relay-client  Receive binary TCP stream and replicate into local SHM")

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -133,5 +134,89 @@ func TestMetricsServerNilHeader(t *testing.T) {
 	body, _ := io.ReadAll(wMetrics.Body)
 	if !strings.Contains(string(body), "tickhub_daemon_status 0") {
 		t.Fatalf("expected status 0 for nil header, got %s", string(body))
+	}
+}
+
+type mockFeedController struct {
+	mu      sync.Mutex
+	enabled bool
+	ticks   uint64
+}
+
+func (m *mockFeedController) FeedStatus() (bool, uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.enabled, m.ticks
+}
+
+func (m *mockFeedController) EnableFeed(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.enabled = true
+	return nil
+}
+
+func (m *mockFeedController) DisableFeed(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.enabled = false
+	return nil
+}
+
+func TestControlFeedEndpoint(t *testing.T) {
+	srv := NewServer(":0", nil)
+
+	// 1. Without feed controller
+	req := httptest.NewRequest("GET", "/control/feed", nil)
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 without feed controller, got %d", w.Code)
+	}
+
+	// 2. Attach mock controller
+	mock := &mockFeedController{enabled: false, ticks: 100}
+	srv.SetFeedController(mock)
+
+	// GET status
+	req = httptest.NewRequest("GET", "/control/feed", nil)
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for GET /control/feed, got %d", w.Code)
+	}
+	body, _ := io.ReadAll(w.Body)
+	if !strings.Contains(string(body), `"enabled":false`) || !strings.Contains(string(body), `"ticks":100`) {
+		t.Fatalf("unexpected body: %s", string(body))
+	}
+
+	// POST enable
+	req = httptest.NewRequest("POST", "/control/feed?action=enable", nil)
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for POST enable, got %d", w.Code)
+	}
+	if !mock.enabled {
+		t.Fatalf("expected controller enabled=true")
+	}
+
+	// POST disable
+	req = httptest.NewRequest("POST", "/control/feed?action=disable", nil)
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for POST disable, got %d", w.Code)
+	}
+	if mock.enabled {
+		t.Fatalf("expected controller enabled=false")
+	}
+
+	// Invalid action
+	req = httptest.NewRequest("POST", "/control/feed?action=invalid", nil)
+	w = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid action, got %d", w.Code)
 	}
 }

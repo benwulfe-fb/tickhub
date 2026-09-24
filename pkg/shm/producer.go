@@ -501,7 +501,9 @@ func (p *Producer) ResetAnchors(firstAnchorNS int64) {
 
 // PublishTelemetry updates dynamic latency, watermark, and tick counters atomically.
 func (p *Producer) PublishTelemetry(publishLatencyNS, watermarkBufferNS int64, droppedTicks, totalTicks uint64) {
-	atomic.StoreInt64(&p.header.AnchorPublishLatencyNS, publishLatencyNS)
+	if publishLatencyNS > 0 {
+		atomic.StoreInt64(&p.header.AnchorPublishLatencyNS, publishLatencyNS)
+	}
 	atomic.StoreInt64(&p.header.WatermarkBufferNS, watermarkBufferNS)
 	atomic.StoreUint64(&p.header.DroppedTickCount, droppedTicks)
 	atomic.StoreUint64(&p.header.TotalTickCount, totalTicks)
