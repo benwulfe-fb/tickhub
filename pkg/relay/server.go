@@ -190,22 +190,18 @@ func (s *Server) handleConn(conn net.Conn) {
 				nextAnchor = earliest
 			}
 
-			// 1. Emit updated snapshots in [windowStart, nextAnchor) (or all baseline snapshots on client connection)
+			// 1. Emit updated snapshots (baseline on connect, then delta-compressed by SeqLock sequence)
 			var numSnapshots uint32 = 0
-			windowStart := nextAnchor - cadenceNS
 			for i := 0; i < int(hdr.TotalSymbols); i++ {
 				readSnapshotSeqLock(s.segment, i, &scratchSnap)
-				if scratchSnap.SeqLockSeq > 0 && scratchSnap.SeqLockSeq != lastSentSeq[i] {
-					if isFirstClientAnchor ||
-						(scratchSnap.SIPTimestampNS >= windowStart && scratchSnap.SIPTimestampNS < nextAnchor) {
-						snapPayload := EncodeSnapshot(uint16(i), &scratchSnap)
-						if err := WritePacket(bw, MsgTypeSnapshot, seq, snapPayload); err != nil {
-							return
-						}
-						seq++
-						lastSentSeq[i] = scratchSnap.SeqLockSeq
-						numSnapshots++
+				if isFirstClientAnchor || (scratchSnap.SeqLockSeq > 0 && scratchSnap.SeqLockSeq != lastSentSeq[i]) {
+					snapPayload := EncodeSnapshot(uint16(i), &scratchSnap)
+					if err := WritePacket(bw, MsgTypeSnapshot, seq, snapPayload); err != nil {
+						return
 					}
+					seq++
+					lastSentSeq[i] = scratchSnap.SeqLockSeq
+					numSnapshots++
 				}
 			}
 			isFirstClientAnchor = false

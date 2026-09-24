@@ -16,11 +16,12 @@ import (
 
 // ClientConfig configures the relay TCP replication client.
 type ClientConfig struct {
-	ServerAddr   string
-	SHMName      string
-	Permissions  uint32
-	UnlinkOnExit bool
-	Timeout      time.Duration
+	ServerAddr      string
+	SHMName         string
+	Permissions     uint32
+	UnlinkOnExit    bool
+	Timeout         time.Duration
+	LatencyBudgetUS int64
 }
 
 // Client connects to a RelayServer, creates a replica SHM segment, and writes replicated frames and snapshots.
@@ -43,6 +44,9 @@ func NewClient(cfg ClientConfig) *Client {
 	}
 	if cfg.SHMName == "" {
 		cfg.SHMName = "tickhub_live"
+	}
+	if cfg.LatencyBudgetUS <= 0 {
+		cfg.LatencyBudgetUS = 150_000 // 150ms default (SLO-06 cross-region WAN)
 	}
 	return &Client{
 		cfg: cfg,
@@ -199,12 +203,13 @@ func (c *Client) runStream(ctx context.Context, conn net.Conn) error {
 			}
 
 			c.producer.CommitFrameFinalize(anchorNS)
+			c.producer.PublishTelemetry(latencyUS*1000, 0, uint64(c.seqGaps.Load()), uint64(c.anchorsCount.Load()))
 			c.anchorsCount.Add(1)
 			c.lastAnchor.Store(anchorNS)
 
-			if latencyUS > 10000 { // 10ms WAN budget (SLO-06)
-				log.Printf("[SLO-VIOLATION] [RELAY-CLI] Replication latency exceeded 10ms budget: %dµs @ anchor %d",
-					latencyUS, anchorNS)
+			if latencyUS > c.cfg.LatencyBudgetUS {
+				log.Printf("[SLO-VIOLATION] [RELAY-CLI] Replication latency exceeded %dms budget: %dµs @ anchor %d",
+					c.cfg.LatencyBudgetUS/1000, latencyUS, anchorNS)
 			}
 
 			log.Printf("[RELAY-CLI] Replicated anchor %d to /dev/shm/%s (%d snapshots, latency %dµs, gaps=%d, reconnects=%d)",

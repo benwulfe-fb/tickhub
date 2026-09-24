@@ -479,6 +479,7 @@ func (p *Producer) CommitFrameFinalizeWithLatency(anchorNS, publishLatNS int64) 
 		}
 	}
 	atomic.StoreInt64(&p.header.LastWrittenAnchorNS, anchorNS)
+	atomic.StoreInt64(&p.header.HeartbeatNS, time.Now().UnixNano())
 }
 
 // CommitFrameFinalize marks the overall frame committed and updates last_written_anchor_ns.

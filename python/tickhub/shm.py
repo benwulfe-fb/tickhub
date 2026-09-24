@@ -412,8 +412,8 @@ class TickHubReader:
         phase_idx = self._phase_name_to_idx[phase_name]
         offset_ms = self._phase_infos[phase_idx].offset_ms
         offset_ns = offset_ms * 1_000_000
-        if self.is_replay_mode:
-            last_written = self.last_written_anchor_ns
+        last_written = self.last_written_anchor_ns
+        if last_written > 0:
             return ((last_written - offset_ns) // self.cadence_ns) * self.cadence_ns + offset_ns
 
         now_ns = time.time_ns()
@@ -545,14 +545,15 @@ class TickHubReader:
 
         # Check staleness: if in replay mode or ANY cursor is stale, skip sleep and drain immediately
         any_stale = any(c.is_stale for c in cursors)
-        if not self.is_replay_mode and not any_stale:
+        min_target_ns = min(c.target_anchor_ns for c in cursors)
+        last_written = self.last_written_anchor_ns
+        if not self.is_replay_mode and not any_stale and min_target_ns > last_written:
             now_ns = time.time_ns()
             latency_ns = self.anchor_publish_latency_ns
-            min_target_ns = min(c.target_anchor_ns for c in cursors)
             ready_ts_ns = min_target_ns + latency_ns
             sleep_sec = (ready_ts_ns - now_ns) / 1e9
             if sleep_sec > 0.0001:
-                await asyncio.sleep(sleep_sec)
+                await asyncio.sleep(min(sleep_sec, 0.05))
 
         return self._load_into_matrix(cursors, out_matrix, timeout_ms)
 
@@ -567,14 +568,15 @@ class TickHubReader:
             return []
 
         any_stale = any(c.is_stale for c in cursors)
-        if not self.is_replay_mode and not any_stale:
+        min_target_ns = min(c.target_anchor_ns for c in cursors)
+        last_written = self.last_written_anchor_ns
+        if not self.is_replay_mode and not any_stale and min_target_ns > last_written:
             now_ns = time.time_ns()
             latency_ns = self.anchor_publish_latency_ns
-            min_target_ns = min(c.target_anchor_ns for c in cursors)
             ready_ts_ns = min_target_ns + latency_ns
             sleep_sec = (ready_ts_ns - now_ns) / 1e9
             if sleep_sec > 0.0001:
-                time.sleep(sleep_sec)
+                time.sleep(min(sleep_sec, 0.05))
 
         return self._load_into_matrix(cursors, out_matrix, timeout_ms)
 

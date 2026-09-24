@@ -52,14 +52,16 @@ func runRelayClient(args []string) {
 	shmName := fs.String("shm", "tickhub_live", "Replica SHM segment name to write to")
 	noUnlink := fs.Bool("no-unlink", false, "Do not unlink replica SHM segment on exit")
 	timeout := fs.Duration("timeout", 10*time.Second, "Connect timeout")
+	latencyBudgetMS := fs.Int64("latency-budget-ms", 150, "Replication latency budget in ms before logging SLO violation")
 	fs.Parse(args)
 
 	cfg := relay.ClientConfig{
-		ServerAddr:   *addr,
-		SHMName:      *shmName,
-		Permissions:  0666,
-		UnlinkOnExit: !*noUnlink,
-		Timeout:      *timeout,
+		ServerAddr:      *addr,
+		SHMName:         *shmName,
+		Permissions:     0666,
+		UnlinkOnExit:    !*noUnlink,
+		Timeout:         *timeout,
+		LatencyBudgetUS: *latencyBudgetMS * 1000,
 	}
 
 	cli := relay.NewClient(cfg)

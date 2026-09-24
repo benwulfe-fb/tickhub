@@ -81,6 +81,7 @@ func runDaemon(args []string) {
 	defer prod.Close()
 
 	projector := project.NewProjector(prod, phaseConfigs, rawCfg.UniqueSymbols, shmCfg.CadenceInterval)
+	projector.SetStartAnchor(time.Now().UnixNano())
 
 	switch recMode {
 	case shm.RecoveryModeWarmSubCadence:
@@ -149,6 +150,15 @@ func runDaemon(args []string) {
 	lastReport := time.Now()
 	ticks := client.Ticks()
 
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	cadenceNS := shmCfg.CadenceInterval.Nanoseconds()
+	if cadenceNS <= 0 {
+		cadenceNS = int64(time.Second)
+	}
+	var lastFlushedAnchor int64 = 0
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -166,12 +176,20 @@ func runDaemon(args []string) {
 			if err := projector.IngestTick(tick); err != nil {
 				log.Printf("[DAEMON] Ingest error: %v", err)
 			}
+		case now := <-ticker.C:
+			// Single-threaded event loop: zero data races with tick ingestion
+			nowNS := now.UnixNano()
+			prod.PublishTelemetry(0, 0, 0, tickCount)
+
+			wallAnchor := (nowNS / cadenceNS) * cadenceNS
+			if wallAnchor > lastFlushedAnchor {
+				_ = projector.Flush(wallAnchor)
+				lastFlushedAnchor = wallAnchor
+			}
 
 			if time.Since(lastReport) >= 5*time.Second {
-				now := time.Now()
 				elapsed := now.Sub(startTime).Seconds()
 				rate := float64(tickCount) / elapsed
-				prod.PublishTelemetry(0, 0, 0, tickCount)
 				log.Printf("[DAEMON] Ingested %d ticks (%.1f/sec), committed %d frames",
 					tickCount, rate, projector.CommittedFrames())
 				lastReport = now
