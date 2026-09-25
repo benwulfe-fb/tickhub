@@ -23,6 +23,8 @@ from .abi import (
     MODE_HISTORICAL_REPLAY,
     MODE_LIVE_STREAMING,
     SNAPSHOT_OFFSET,
+    CONFIG_AREA_OFFSET,
+    MAX_CONFIG_BYTES,
     FLAG_COLD_START,
     RECOVERY_MODE_COLD_START,
     RECOVERY_MODE_WARM_SUB_CADENCE,
@@ -250,6 +252,44 @@ class TickHubReader:
         self.num_phases = self._header.num_phases
         self.total_symbols = self._header.total_symbols
 
+        # Read published config from SHM if present
+        self.raw_config_yaml: Optional[str] = None
+        shm_config: dict[str, Any] = {}
+        c_off = self._header.config_offset or CONFIG_AREA_OFFSET
+        c_len = self._header.config_len
+        if c_len > 0 and c_off + c_len <= self._file_size:
+            raw_bytes = bytes(self._mmap[c_off : c_off + c_len])
+            try:
+                self.raw_config_yaml = raw_bytes.decode("utf-8")
+                parsed = yaml.safe_load(self.raw_config_yaml)
+                if isinstance(parsed, dict):
+                    shm_config = parsed
+            except Exception as e:
+                logger.warning("Failed to parse published config YAML from SHM: %s", e)
+        elif self._header.config_len == 0 and c_off + 64 <= self._file_size:
+            # Fallback probe at CONFIG_AREA_OFFSET
+            probe = bytes(self._mmap[CONFIG_AREA_OFFSET : CONFIG_AREA_OFFSET + 256])
+            if b"shm:" in probe or b"phases:" in probe or b"features:" in probe or b"symbols:" in probe:
+                null_idx = probe.find(b"\x00")
+                read_len = null_idx if null_idx != -1 else 256
+                try:
+                    self.raw_config_yaml = bytes(self._mmap[CONFIG_AREA_OFFSET : CONFIG_AREA_OFFSET + read_len]).decode("utf-8")
+                    parsed = yaml.safe_load(self.raw_config_yaml)
+                    if isinstance(parsed, dict):
+                        shm_config = parsed
+                except Exception:
+                    pass
+
+        # If caller did not provide config dict or file, use the published SHM config
+        if not self.config and shm_config:
+            self.config = shm_config
+        elif self.config and shm_config:
+            merged = dict(shm_config)
+            merged.update(self.config)
+            self.config = merged
+
+        self.features: list[str] = list(self.config.get("features", []))
+
         # Directory and Snapshot lookups
         self._symbol_to_dir_idx: dict[str, int] = {}
         for i in range(self.total_symbols):
@@ -286,6 +326,21 @@ class TickHubReader:
         self._boot_id = self._header.boot_id
         self._generation = self._header.generation
         self._auto_realign = bool(self.config.get("auto_realign", False))
+
+    @property
+    def symbols(self) -> list[str]:
+        """All unique symbols in directory order."""
+        return sorted(self._symbol_to_dir_idx.keys(), key=lambda s: self._symbol_to_dir_idx[s])
+
+    @property
+    def phase_names(self) -> list[str]:
+        """List of configured phase names."""
+        return [self._phase_idx_to_name[i] for i in range(self.num_phases)]
+
+    @property
+    def phase_symbols(self) -> dict[str, list[str]]:
+        """Mapping from phase name to symbols in that phase."""
+        return dict(self._phase_symbols)
 
     @property
     def boot_id(self) -> int:

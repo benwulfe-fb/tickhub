@@ -8,7 +8,6 @@ import pandas as pd
 import pyarrow.parquet as pq
 import pytest
 
-from ccm.marketdata.projection import project_to_1hz
 from tickhub import export_features
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -73,29 +72,13 @@ def test_bitwise_parquet_parity_with_legacy_engine():
     table = pq.read_table(OUTPUT_PARQUET)
     assert len(table) == 59
 
-    # 3. Execute legacy engine project_to_1hz on identical input Parquet files
-    q_df = pd.read_parquet(DATALAKE_DIR / "2026-05-06" / "D" / "DASH.quotes.parquet")
-    t_df = pd.read_parquet(DATALAKE_DIR / "2026-05-06" / "D" / "DASH.trades.parquet")
-
-    raw = {
-        "quote_bid_px": q_df["bid_price"].values.astype(np.float64),
-        "quote_ask_px": q_df["ask_price"].values.astype(np.float64),
-        "quote_bid_sz": q_df["bid_size"].values.astype(np.float64),
-        "quote_ask_sz": q_df["ask_size"].values.astype(np.float64),
-        "quote_sip_timestamp": q_df["sip_timestamp"].values.astype(np.int64),
-        "trade_px": t_df["price"].values.astype(np.float64),
-        "trade_sz": t_df["size"].values.astype(np.float64),
-        "trade_sip_timestamp": t_df["sip_timestamp"].values.astype(np.int64),
-    }
-
-    s_start = 1778074260000000000
-    s_end = 1778074320000000000
-    legacy_proj = project_to_1hz(raw, s_start=s_start, s_end=s_end, date="2026-05-06")
+    # 3. Load precomputed golden reference projection
+    ref = np.load(REPO_ROOT / "tests" / "fixtures" / "golden" / "reference_1hz.npz")
 
     # 4. Bitwise Parity Assertions
     # A. Volume Parity: vol_1s == (buy_volume + sell_volume)
     tickhub_vol = table["vol_1s"].to_numpy()
-    legacy_vol = (legacy_proj["buy_volume"] + legacy_proj["sell_volume"])[:len(tickhub_vol)]
+    legacy_vol = (ref["buy_volume"] + ref["sell_volume"])[:len(tickhub_vol)]
     vol_delta = np.max(np.abs(tickhub_vol - legacy_vol))
     np.testing.assert_equal(
         tickhub_vol,
@@ -105,7 +88,7 @@ def test_bitwise_parquet_parity_with_legacy_engine():
 
     # B. Return Parity: log_ret_1s == ln(P_T / P_{T-1})
     tickhub_ret = table["log_ret_1s"].to_numpy()
-    legacy_px = legacy_proj["last_trade_px"][:len(tickhub_vol)]
+    legacy_px = ref["last_trade_px"][:len(tickhub_vol)]
     p_prev = np.empty_like(legacy_px)
     p_prev[0] = legacy_px[0]
     p_prev[1:] = legacy_px[:-1]
@@ -128,8 +111,8 @@ def test_bitwise_parquet_parity_with_legacy_engine():
     # From arrival of first quote onward (all 53 post-quote frames 6..58), assert 100% bitwise parity.
     tickhub_spread = table["spread_bps"].to_numpy()
     assert (tickhub_spread[:6] == 1.0).all(), "Expected 1.0 default spread for unseeded pre-quote frames 0-5"
-    legacy_bid = legacy_proj["last_bid_px"][:len(tickhub_vol)][6:]
-    legacy_ask = legacy_proj["last_ask_px"][:len(tickhub_vol)][6:]
+    legacy_bid = ref["last_bid_px"][:len(tickhub_vol)][6:]
+    legacy_ask = ref["last_ask_px"][:len(tickhub_vol)][6:]
     calc_spread = ((legacy_ask - legacy_bid) / legacy_px[6:]) * 10000.0
     spread_delta = np.max(np.abs(tickhub_spread[6:] - calc_spread))
     np.testing.assert_equal(

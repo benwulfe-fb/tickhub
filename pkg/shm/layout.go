@@ -6,14 +6,16 @@ const (
 	MagicBytes        uint64 = 0x5449434B48554231 // "TICKHUB1"
 	CurrentABIVersion uint32 = 1
 
-	HeaderOffset    uintptr = 0x00000000
-	DirectoryOffset uintptr = 0x00000400
-	SnapshotOffset  uintptr = 0x00001000
-	DataAreaOffset  uintptr = 0x00010000 // 64 KB boundary (page aligned)
+	HeaderOffset     uintptr = 0x00000000
+	DirectoryOffset  uintptr = 0x00000400
+	SnapshotOffset   uintptr = 0x00001000
+	ConfigAreaOffset uintptr = 0x00005000
+	DataAreaOffset   uintptr = 0x00010000 // 64 KB boundary (page aligned)
 
 	MaxDirectorySymbols = 192
 	MaxSnapshotSymbols  = 128
 	MaxPhases           = 8
+	MaxConfigBytes      = 0x0000B000 // 44 KB (0x00005000 to 0x00010000)
 
 	// Status flags
 	StatusUninitialized uint32 = 0
@@ -97,7 +99,12 @@ type GlobalHeader struct {
 	// Control Line (Producer line at offset 0x0200 = 512 bytes)
 	ControlResp ControlResponse
 
-	_reserved [448]byte
+	// Config Line (Aligned to 64 bytes at offset 0x0240 = 576 bytes)
+	ConfigOffset uint64
+	ConfigLen    uint32
+	_padConfig   [52]byte
+
+	_reserved [384]byte
 }
 
 // ControlRequest is written by the consumer on a dedicated 64-byte cache line (offset 0x01C0).
@@ -180,5 +187,7 @@ var (
 	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.Phases)-192]
 	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.ControlReq)-448]
 	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.ControlResp)-512]
+	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.ConfigOffset)-576]
+	_ = [1]byte{}[unsafe.Offsetof(GlobalHeader{}.ConfigLen)-584]
 )
 

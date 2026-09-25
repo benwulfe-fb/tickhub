@@ -34,7 +34,7 @@
 1. **Verify Reader / Producer Core Overlap**:
    ```bash
    taskset -cp $(pgrep tickhub)
-   taskset -cp $(pgrep -f "python.*ccm")
+   taskset -cp $(pgrep -f "python.*trading_engine")
    ```
    If reader and producer share the same logical hyperthread, producer context-switching out mid-write leaves SeqLock sequence odd (`seq & 1 == 1`), stalling reader until producer is rescheduled.
 2. **Inspect SHM Memory Bus Saturation**:
@@ -57,7 +57,7 @@
    # Pin tickhub daemon to Core 2
    taskset -cp 2 $(pgrep tickhub)
    # Pin execution engine to Cores 4-8
-   taskset -cp 4-8 $(pgrep -f "ccm-live")
+   taskset -cp 4-8 $(pgrep -f "trading-engine")
    ```
 2. **Ensure Non-Allocating Read Loop in Python**:
    Verify Python consumers read `SymbolSnapshot` directly via memoryview or ctypes/C-atomic wrapper rather than performing heavy deserialization within the spin window.

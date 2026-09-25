@@ -126,14 +126,14 @@ func (c *Client) runStream(ctx context.Context, conn net.Conn) error {
 		return fmt.Errorf("expected handshake (0x%02X), got 0x%02X", MsgTypeHandshake, msgType)
 	}
 
-	h, phases, symbols, err := DecodeHandshake(payload)
+	h, phases, symbols, configYAML, err := DecodeHandshake(payload)
 	if err != nil {
 		return fmt.Errorf("decode handshake: %w", err)
 	}
 
 	// 2. Create replica SHM Producer if not yet allocated
 	if c.producer == nil {
-		shmCfg := createReplicaConfig(c.cfg, h, phases, symbols)
+		shmCfg := createReplicaConfig(c.cfg, h, phases, symbols, configYAML)
 		prod, err := shm.CreateProducer(shmCfg)
 		if err != nil {
 			return fmt.Errorf("create replica producer %s: %w", c.cfg.SHMName, err)
@@ -263,7 +263,7 @@ func (c *Client) Close() error {
 	return nil
 }
 
-func createReplicaConfig(cfg ClientConfig, h *HandshakeHeader, phases []shm.PhaseInfo, symbols []string) shm.Config {
+func createReplicaConfig(cfg ClientConfig, h *HandshakeHeader, phases []shm.PhaseInfo, symbols []string, configYAML []byte) shm.Config {
 	phaseConfigs := make([]shm.PhaseConfig, len(phases))
 	for i, p := range phases {
 		syms := make([]string, p.NumSymbols)
@@ -306,5 +306,6 @@ func createReplicaConfig(cfg ClientConfig, h *HandshakeHeader, phases []shm.Phas
 		Permissions:     perm,
 		UnlinkOnExit:    cfg.UnlinkOnExit,
 		Mode:            h.Mode,
+		RawYAML:         configYAML,
 	}
 }

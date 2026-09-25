@@ -284,4 +284,72 @@ func TestProducerWarmAndGapRecovery(t *testing.T) {
 	}
 }
 
+func TestProducerConfigPublication(t *testing.T) {
+	// 1. Test synthesized YAML
+	cfg := Config{
+		Name:      "test_config_pub",
+		MaxFrames: 16,
+		Phases: []PhaseConfig{
+			{
+				ID:       0,
+				Name:     "alpha",
+				OffsetMS: 0,
+				Symbols:  []string{"AAPL", "GOOG"},
+			},
+		},
+		UniqueSymbols:   []string{"AAPL", "GOOG"},
+		Features:        []string{"vol_1s", "ret_1s"},
+		CadenceInterval: 1 * time.Second,
+		UnlinkOnExit:    true,
+	}
+
+	prod, err := CreateProducer(cfg)
+	if err != nil {
+		t.Fatalf("CreateProducer failed: %v", err)
+	}
+	defer prod.Close()
+
+	if prod.header.ConfigOffset != uint64(ConfigAreaOffset) {
+		t.Fatalf("expected ConfigOffset 0x%X, got 0x%X", ConfigAreaOffset, prod.header.ConfigOffset)
+	}
+	if prod.header.ConfigLen == 0 {
+		t.Fatalf("expected ConfigLen > 0, got 0")
+	}
+
+	raw := prod.segment.Bytes()
+	yamlBytes := raw[prod.header.ConfigOffset : prod.header.ConfigOffset+uint64(prod.header.ConfigLen)]
+	yamlStr := string(yamlBytes)
+	if len(yamlStr) == 0 {
+		t.Fatalf("empty config YAML in SHM")
+	}
+
+	// 2. Test explicit RawYAML
+	customYAML := []byte("custom_shm_key: special_value\n")
+	cfg2 := Config{
+		Name:            "test_config_explicit",
+		MaxFrames:       16,
+		Phases:          cfg.Phases,
+		UniqueSymbols:   cfg.UniqueSymbols,
+		Features:        cfg.Features,
+		CadenceInterval: 1 * time.Second,
+		UnlinkOnExit:    true,
+		RawYAML:         customYAML,
+	}
+	prod2, err := CreateProducer(cfg2)
+	if err != nil {
+		t.Fatalf("CreateProducer with RawYAML failed: %v", err)
+	}
+	defer prod2.Close()
+
+	if prod2.header.ConfigLen != uint32(len(customYAML)) {
+		t.Fatalf("expected ConfigLen %d, got %d", len(customYAML), prod2.header.ConfigLen)
+	}
+	raw2 := prod2.segment.Bytes()
+	yamlBytes2 := raw2[prod2.header.ConfigOffset : prod2.header.ConfigOffset+uint64(prod2.header.ConfigLen)]
+	if string(yamlBytes2) != string(customYAML) {
+		t.Fatalf("expected '%s', got '%s'", string(customYAML), string(yamlBytes2))
+	}
+}
+
+
 

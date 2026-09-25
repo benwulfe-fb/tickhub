@@ -46,7 +46,7 @@
    If process does not exist, it terminated abruptly (e.g. `SIGKILL`, OOM killer).
 2. **Inspect Process State for D-State or Deadlock**:
    ```bash
-   ps aux | grep -E "tickhub|ccm-live"
+   ps aux | grep -E "tickhub|trading-engine"
    ```
    Check if process is in uninterruptible sleep (`D` state, typically waiting on I/O) or CPU lock.
 3. **Capture Stack Trace of Stalled Process**:

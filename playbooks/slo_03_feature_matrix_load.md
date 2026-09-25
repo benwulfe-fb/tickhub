@@ -61,7 +61,7 @@
    ```
 3. **Pin Python Worker to Dedicated Isolated Core**:
    ```bash
-   taskset -cp 4 $(pgrep -f "ccm-live")
+   taskset -cp 4 $(pgrep -f "trading-engine")
    ```
 
 ---

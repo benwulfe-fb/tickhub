@@ -196,6 +196,7 @@ func runDaemon(args []string) {
 		UnlinkOnExit:    !*noUnlink,
 		Mode:            shm.ModeLiveStreaming,
 		AllowRecovery:   *allowRecovery,
+		RawYAML:         cfgData,
 	}
 
 	prod, recMode, err := shm.CreateProducerWithRecovery(shmCfg)

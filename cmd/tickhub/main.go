@@ -164,6 +164,7 @@ func runReplay(args []string) {
 		Permissions:     0666,
 		UnlinkOnExit:    !*noUnlink,
 		Mode:            shm.ModeHistoricalReplay,
+		RawYAML:         cfgData,
 	}
 
 	prod, err := shm.CreateProducer(shmCfg)

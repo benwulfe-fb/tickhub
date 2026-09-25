@@ -6,11 +6,13 @@ CURRENT_ABI_VERSION = 1
 HEADER_OFFSET = 0x00000000
 DIRECTORY_OFFSET = 0x00000400
 SNAPSHOT_OFFSET = 0x00001000
+CONFIG_AREA_OFFSET = 0x00005000
 DATA_AREA_OFFSET = 0x00010000
 
 MAX_DIRECTORY_SYMBOLS = 192
 MAX_SNAPSHOT_SYMBOLS = 128
 MAX_PHASES = 8
+MAX_CONFIG_BYTES = 0x0000B000
 
 STATUS_UNINITIALIZED = 0
 STATUS_BOOTING = 1
@@ -103,7 +105,10 @@ class GlobalHeader(ctypes.Structure):
         ("phases", PhaseInfo * MAX_PHASES),
         ("control_req", ControlRequest),
         ("control_resp", ControlResponse),
-        ("_reserved", ctypes.c_uint8 * 448),
+        ("config_offset", ctypes.c_uint64),
+        ("config_len", ctypes.c_uint32),
+        ("_pad_config", ctypes.c_uint8 * 52),
+        ("_reserved", ctypes.c_uint8 * 384),
     ]
 
 
@@ -167,3 +172,5 @@ assert GlobalHeader.last_read_anchor_ns.offset == 128, f"Consumer line misaligne
 assert GlobalHeader.phases.offset == 192, f"Phases array misaligned: {GlobalHeader.phases.offset}"
 assert GlobalHeader.control_req.offset == 448, f"control_req misaligned: {GlobalHeader.control_req.offset}"
 assert GlobalHeader.control_resp.offset == 512, f"control_resp misaligned: {GlobalHeader.control_resp.offset}"
+assert GlobalHeader.config_offset.offset == 576, f"config_offset misaligned: {GlobalHeader.config_offset.offset}"
+assert GlobalHeader.config_len.offset == 584, f"config_len misaligned: {GlobalHeader.config_len.offset}"

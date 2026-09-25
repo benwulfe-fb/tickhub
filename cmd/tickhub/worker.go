@@ -61,6 +61,7 @@ func runWorker(args []string) {
 		Permissions:     0666,
 		UnlinkOnExit:    true,
 		Mode:            shm.ModeHistoricalReplay,
+		RawYAML:         cfgData,
 	}
 
 	prod, err := shm.CreateProducer(shmCfg)

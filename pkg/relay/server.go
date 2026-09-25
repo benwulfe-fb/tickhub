@@ -123,7 +123,16 @@ func (s *Server) handleConn(conn net.Conn) {
 		NumPhases:         hdr.NumPhases,
 	}
 
-	handshakePayload := EncodeHandshake(h, phases, symbols)
+	var configYAML []byte
+	if hdr.ConfigLen > 0 && hdr.ConfigOffset > 0 {
+		raw := s.segment.Bytes()
+		endOffset := hdr.ConfigOffset + uint64(hdr.ConfigLen)
+		if int(endOffset) <= len(raw) {
+			configYAML = raw[hdr.ConfigOffset:endOffset]
+		}
+	}
+
+	handshakePayload := EncodeHandshake(h, phases, symbols, configYAML)
 	var seq uint64 = 1
 	if err := WritePacket(conn, MsgTypeHandshake, seq, handshakePayload); err != nil {
 		log.Printf("[RELAY-SRV] Handshake write error to %s: %v", conn.RemoteAddr(), err)

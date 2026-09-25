@@ -24,7 +24,7 @@ This directory contains incident response, diagnostic, and remediation playbooks
 
 1. **P0 (Emergency - Capital Risk)**:
    - **Triggers**: SLO-04 (Frame Loss), SLO-05 (Relay Packet Sequence Gap), SLO-09 (Heartbeat Stalled $> 3\text{s}$).
-   - **Immediate Action**: Inhibit new trading orders in downstream execution models (`ccm-live` / `ccm-paper`).
+   - **Immediate Action**: Inhibit new trading orders in downstream execution models.
    - **Resolution Goal**: Resync memory state or failover within 5 seconds.
 2. **P1 (Urgent - Latency / Performance Regression)**:
    - **Triggers**: SLO-01 (1Hz Publishing Latency), SLO-06 (Relay Latency $> 10\text{ms}$), SLO-07 (Recovery Delay $> 200\text{ms}$), SLO-08 (Cold Start Warmup Active).

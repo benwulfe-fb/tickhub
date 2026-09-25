@@ -145,7 +145,7 @@ def main():
         "nohup /tmp/tickhub_deploy/tickhub_bin daemon "
         "--config /tmp/tickhub_deploy/live_72.yaml "
         "--shm-name tickhub_live "
-        "--api-key $(sudo cat /run/ccm-secrets/massive/massive_api_key) "
+        "--api-key $(sudo cat /run/secrets/massive/massive_api_key 2>/dev/null || echo $MASSIVE_API_KEY) "
         "> /tmp/tickhub_deploy/daemon.log 2>&1 & echo $! > /tmp/tickhub_daemon.pid"
     )
     ssh_cmd(vm_daemon_cmd)

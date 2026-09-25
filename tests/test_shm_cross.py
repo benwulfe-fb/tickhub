@@ -79,6 +79,21 @@ def test_shm_metadata_and_snapshots(producer_process):
         assert snap_aapl["bid_px"] == 200.0
 
 
+def test_shm_connection_with_only_address(producer_process):
+    # Connect with ONLY the SHM address path, NO config dict or config file
+    with TickHubReader(f"/dev/shm/{SHM_NAME}") as hub:
+        assert hub.status == 2  # StatusRunning
+        assert hub.raw_config_yaml is not None
+        assert len(hub.raw_config_yaml) > 0
+        assert hub.config is not None
+        # Verify full layout specification directly or inferred from published config
+        assert hub.features == ["ret_1s", "ret_5s", "ret_15s", "vol_1s", "spread_bps"]
+        assert hub.phases == ["phase_0ms", "phase_500ms"]
+        assert hub.phase_symbols["phase_0ms"] == ["SPY", "QQQ", "AAPL", "MSFT"]
+        assert hub.phase_symbols["phase_500ms"] == ["SPY", "QQQ", "NVDA", "AMZN"]
+        assert hub.symbols == ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMZN"]
+
+
 def test_phase_symbol_partitioning_and_cursors(producer_process):
     with TickHubReader(TEST_CONFIG) as hub:
         all_cursors, _ = hub.begin_all()

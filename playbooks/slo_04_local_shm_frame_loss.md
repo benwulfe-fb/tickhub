@@ -37,7 +37,7 @@
 1. **Check Consumer Process Health**:
    Identify if consumer thread is blocked, crashed, or running slow:
    ```bash
-   top -b -n 1 -p $(pgrep -f "ccm-live")
+   top -b -n 1 -p $(pgrep -f "trading-engine")
    ```
 2. **Inspect Ring Buffer Capacity vs Consumer Read Head**:
    Inspect producer `LastWrittenAnchorNS` vs consumer `LastReadAnchorNS`:
@@ -58,8 +58,8 @@
 1. **Immediate Consumer Health Check**:
    If consumer process is unresponsive or deadlock has occurred, kill and restart consumer:
    ```bash
-   kill -9 $(pgrep -f "ccm-live")
-   systemctl start ccm-live
+   kill -9 $(pgrep -f "trading-engine")
+   systemctl start trading-engine
    ```
    Consumer will attach to resident `/dev/shm/tickhub_live` and immediately align to latest available anchor.
 2. **Offload Heavy Async Processing**:

@@ -34,11 +34,15 @@ func TestProtocolEncodingDecoding(t *testing.T) {
 		},
 	}
 	symbols := []string{"AAPL", "NVDA"}
+	customYAML := []byte("features:\n  - f1\n  - f2\n")
 
-	buf := EncodeHandshake(h, phases, symbols)
-	hDec, phasesDec, symbolsDec, err := DecodeHandshake(buf)
+	buf := EncodeHandshake(h, phases, symbols, customYAML)
+	hDec, phasesDec, symbolsDec, configYAMLDec, err := DecodeHandshake(buf)
 	if err != nil {
 		t.Fatalf("DecodeHandshake error: %v", err)
+	}
+	if string(configYAMLDec) != string(customYAML) {
+		t.Fatalf("configYAML mismatch: expected '%s', got '%s'", string(customYAML), string(configYAMLDec))
 	}
 	if hDec.Magic != RelayMagic || hDec.Version != RelayVersion || hDec.MaxFrames != 64 || hDec.Mode != 1 {
 		t.Fatalf("Handshake header mismatch: %+v", hDec)

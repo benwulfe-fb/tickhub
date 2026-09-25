@@ -21,7 +21,8 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PYTHON_EXE = sys.executable
+conda_python = Path("/mnt/wc/miniconda3/envs/gpu_env/bin/python")
+PYTHON_EXE = os.environ.get("PYTHON_EXE") or (str(conda_python) if conda_python.exists() else sys.executable)
 GO_EXE = shutil.which("go") or "/mnt/wc/go/bin/go"
 
 
@@ -123,10 +124,12 @@ def validate_abi_alignments():
         "assert GlobalHeader.phases.offset == 192, f'Phases offset: {GlobalHeader.phases.offset}'\n"
         "assert GlobalHeader.control_req.offset == 448, f'control_req offset: {GlobalHeader.control_req.offset}'\n"
         "assert GlobalHeader.control_resp.offset == 512, f'control_resp offset: {GlobalHeader.control_resp.offset}'\n"
+        "assert GlobalHeader.config_offset.offset == 576, f'config_offset: {GlobalHeader.config_offset.offset}'\n"
+        "assert GlobalHeader.config_len.offset == 584, f'config_len: {GlobalHeader.config_len.offset}'\n"
         "print('All ABI assertions passed successfully.')\n"
     )
     env = os.environ.copy()
-    env["PYTHONPATH"] = f"{ROOT / 'python'}:/mnt/wc/src:{env.get('PYTHONPATH', '')}"
+    env["PYTHONPATH"] = f"{ROOT / 'python'}:{env.get('PYTHONPATH', '')}"
     proc = subprocess.run(
         [PYTHON_EXE, "-c", check_script],
         cwd=str(ROOT),
@@ -162,7 +165,7 @@ def validate_python_tests():
     """Run pytest suite excluding golden replay (which runs in stage 6)."""
     telemetry.log("==================== [5/7] Python Pytest Suite ====================")
     env = os.environ.copy()
-    env["PYTHONPATH"] = f"{ROOT / 'python'}:/mnt/wc/src:{env.get('PYTHONPATH', '')}"
+    env["PYTHONPATH"] = f"{ROOT / 'python'}:{env.get('PYTHONPATH', '')}"
     proc = subprocess.run(
         [PYTHON_EXE, "-m", "pytest", "-v", "--ignore=tests/test_golden_replay.py", "tests/"],
         cwd=str(ROOT),
@@ -186,7 +189,7 @@ def validate_golden_replay():
     """Run golden replay bit-identical certification and performance regression gate."""
     telemetry.log("==================== [6/7] Golden Replay & Performance Regression Gate ====================")
     env = os.environ.copy()
-    env["PYTHONPATH"] = f"{ROOT / 'python'}:/mnt/wc/src:{env.get('PYTHONPATH', '')}"
+    env["PYTHONPATH"] = f"{ROOT / 'python'}:{env.get('PYTHONPATH', '')}"
     proc = subprocess.run(
         [PYTHON_EXE, "-m", "pytest", "-v", "-s", "tests/test_golden_replay.py"],
         cwd=str(ROOT),

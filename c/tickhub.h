@@ -30,6 +30,27 @@ typedef struct {
 } PhaseInfo; // 32 bytes
 
 typedef struct {
+    uint64_t request_id;
+    uint32_t command;
+    uint32_t date;
+    char     symbol[8];
+    int64_t  start_anchor_ns;
+    int64_t  end_anchor_ns;
+    uint8_t  _pad[24];
+} ControlRequest; // 64 bytes
+
+typedef struct {
+    uint64_t response_id;
+    uint32_t status;
+    uint32_t num_frames_written;
+    uint32_t cold_start_frames;
+    uint32_t _pad;
+    int64_t  first_anchor_ns;
+    int64_t  last_anchor_ns;
+    char     error_msg[24];
+} ControlResponse; // 64 bytes
+
+typedef struct {
     uint64_t magic;                    // offset 0
     uint32_t version;                  // offset 8
     uint32_t status;                   // offset 12
@@ -55,7 +76,12 @@ typedef struct {
     int64_t  consumer_heartbeat;       // offset 144
     uint8_t  _pad_consumer[40];        // offset 152
     PhaseInfo phases[TICKHUB_MAX_PHASES]; // offset 192 (8 * 32 = 256 bytes)
-    uint8_t  _pad_tail[576];           // offset 448 (Total = 1024 bytes)
+    ControlRequest control_req;        // offset 448 (64 bytes)
+    ControlResponse control_resp;      // offset 512 (64 bytes)
+    uint64_t config_offset;            // offset 576 (8 bytes)
+    uint32_t config_len;               // offset 584 (4 bytes)
+    uint8_t  _pad_config[52];          // offset 588 (52 bytes)
+    uint8_t  _reserved[384];           // offset 640 (384 bytes, Total = 1024 bytes)
 } GlobalHeader;
 
 typedef struct {

@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"gopkg.in/yaml.v3"
 )
 
 // PhaseConfig defines geometry for a phase within the daemon configuration.
@@ -34,6 +36,7 @@ type Config struct {
 	UnlinkOnExit    bool
 	Mode            uint32 // ModeLiveStreaming (0) or ModeHistoricalReplay (1)
 	AllowRecovery   bool   // Attempt warm/resident recovery if segment is present
+	RawYAML         []byte // Serialized YAML published at ConfigAreaOffset in SHM
 }
 
 var (
@@ -151,6 +154,20 @@ func CreateProducer(cfg Config) (*Producer, error) {
 		phaseSymMap[i] = m
 	}
 
+	// Publish Configuration YAML into SHM at ConfigAreaOffset
+	yamlBytes := cfg.RawYAML
+	if len(yamlBytes) == 0 {
+		yamlBytes = synthesizeConfigYAML(cfg)
+	}
+	if len(yamlBytes) > 0 {
+		if uintptr(len(yamlBytes)) > MaxConfigBytes {
+			yamlBytes = yamlBytes[:MaxConfigBytes]
+		}
+		copy(raw[ConfigAreaOffset:ConfigAreaOffset+uintptr(len(yamlBytes))], yamlBytes)
+		header.ConfigOffset = uint64(ConfigAreaOffset)
+		header.ConfigLen = uint32(len(yamlBytes))
+	}
+
 	return &Producer{
 		cfg:          cfg,
 		segment:      seg,
@@ -266,6 +283,23 @@ func CreateProducerWithRecovery(cfg Config) (*Producer, uint32, error) {
 						m[s] = sIdx
 					}
 					phaseSymMap[i] = m
+				}
+
+				// Ensure Config YAML is populated
+				if hdr.ConfigLen == 0 || len(cfg.RawYAML) > 0 {
+					yamlBytes := cfg.RawYAML
+					if len(yamlBytes) == 0 {
+						yamlBytes = synthesizeConfigYAML(cfg)
+					}
+					if len(yamlBytes) > 0 {
+						if uintptr(len(yamlBytes)) > MaxConfigBytes {
+							yamlBytes = yamlBytes[:MaxConfigBytes]
+						}
+						raw := seg.Bytes()
+						copy(raw[ConfigAreaOffset:ConfigAreaOffset+uintptr(len(yamlBytes))], yamlBytes)
+						hdr.ConfigOffset = uint64(ConfigAreaOffset)
+						hdr.ConfigLen = uint32(len(yamlBytes))
+					}
 				}
 
 				// Step C: Atomic Metadata Publishing
@@ -650,4 +684,51 @@ func (p *Producer) Close() error {
 		return p.segment.Close(p.cfg.UnlinkOnExit)
 	}
 	return nil
+}
+
+type yamlSHM struct {
+	Name            string `yaml:"name"`
+	MaxFrames       uint32 `yaml:"max_frames"`
+	CadenceInterval int64  `yaml:"cadence_interval"`
+}
+
+type yamlPhase struct {
+	ID       uint32   `yaml:"id"`
+	Name     string   `yaml:"name"`
+	OffsetMS uint32   `yaml:"offset_ms"`
+	Symbols  []string `yaml:"symbols"`
+}
+
+type yamlFullConfig struct {
+	SHM           yamlSHM     `yaml:"shm"`
+	UniqueSymbols []string    `yaml:"unique_symbols"`
+	Features      []string    `yaml:"features"`
+	Phases        []yamlPhase `yaml:"phases"`
+}
+
+func synthesizeConfigYAML(cfg Config) []byte {
+	phases := make([]yamlPhase, len(cfg.Phases))
+	for i, p := range cfg.Phases {
+		phases[i] = yamlPhase{
+			ID:       p.ID,
+			Name:     p.Name,
+			OffsetMS: p.OffsetMS,
+			Symbols:  p.Symbols,
+		}
+	}
+	full := yamlFullConfig{
+		SHM: yamlSHM{
+			Name:            cfg.Name,
+			MaxFrames:       cfg.MaxFrames,
+			CadenceInterval: cfg.CadenceInterval.Nanoseconds(),
+		},
+		UniqueSymbols: cfg.UniqueSymbols,
+		Features:      cfg.Features,
+		Phases:        phases,
+	}
+	out, err := yaml.Marshal(full)
+	if err != nil {
+		return nil
+	}
+	return out
 }

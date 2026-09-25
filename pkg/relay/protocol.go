@@ -37,9 +37,9 @@ type HandshakeHeader struct {
 	NumPhases         uint32
 }
 
-// EncodeHandshake encodes HandshakeHeader, PhaseInfos, and Symbol names.
-func EncodeHandshake(h HandshakeHeader, phases []shm.PhaseInfo, symbols []string) []byte {
-	buf := make([]byte, 36+len(phases)*32+len(symbols)*16)
+// EncodeHandshake encodes HandshakeHeader, PhaseInfos, Symbol names, and optional configYAML.
+func EncodeHandshake(h HandshakeHeader, phases []shm.PhaseInfo, symbols []string, configYAML []byte) []byte {
+	buf := make([]byte, 36+len(phases)*32+len(symbols)*16+len(configYAML))
 	binary.BigEndian.PutUint32(buf[0:4], h.Magic)
 	binary.BigEndian.PutUint32(buf[4:8], h.Version)
 	binary.BigEndian.PutUint32(buf[8:12], h.ABIVersion)
@@ -65,13 +65,17 @@ func EncodeHandshake(h HandshakeHeader, phases []shm.PhaseInfo, symbols []string
 		offset += 16
 	}
 
+	if len(configYAML) > 0 {
+		copy(buf[offset:], configYAML)
+	}
+
 	return buf
 }
 
-// DecodeHandshake decodes binary payload into HandshakeHeader, PhaseInfos, and Symbol names.
-func DecodeHandshake(data []byte) (*HandshakeHeader, []shm.PhaseInfo, []string, error) {
+// DecodeHandshake decodes binary payload into HandshakeHeader, PhaseInfos, Symbol names, and configYAML.
+func DecodeHandshake(data []byte) (*HandshakeHeader, []shm.PhaseInfo, []string, []byte, error) {
 	if len(data) < 36 {
-		return nil, nil, nil, io.ErrUnexpectedEOF
+		return nil, nil, nil, nil, io.ErrUnexpectedEOF
 	}
 
 	h := &HandshakeHeader{
@@ -86,15 +90,15 @@ func DecodeHandshake(data []byte) (*HandshakeHeader, []shm.PhaseInfo, []string, 
 	}
 
 	if h.Magic != RelayMagic {
-		return nil, nil, nil, ErrInvalidMagic
+		return nil, nil, nil, nil, ErrInvalidMagic
 	}
 	if h.Version != RelayVersion {
-		return nil, nil, nil, ErrVersionMismatch
+		return nil, nil, nil, nil, ErrVersionMismatch
 	}
 
 	expectedLen := 36 + int(h.NumPhases)*32 + int(h.TotalSymbols)*16
 	if len(data) < expectedLen {
-		return nil, nil, nil, io.ErrUnexpectedEOF
+		return nil, nil, nil, nil, io.ErrUnexpectedEOF
 	}
 
 	phases := make([]shm.PhaseInfo, h.NumPhases)
@@ -125,7 +129,13 @@ func DecodeHandshake(data []byte) (*HandshakeHeader, []shm.PhaseInfo, []string, 
 		offset += 16
 	}
 
-	return h, phases, symbols, nil
+	var configYAML []byte
+	if len(data) > offset {
+		configYAML = make([]byte, len(data)-offset)
+		copy(configYAML, data[offset:])
+	}
+
+	return h, phases, symbols, configYAML, nil
 }
 
 // EncodeSnapshot encodes symbolIdx and SymbolSnapshot.

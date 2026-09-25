@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reference execution engine client consuming 1Hz market data from POSIX SHM.
 
-Simulates downstream quantitative model execution (e.g. ccm-live on VM or ccm-paper on WSL).
+Simulates downstream quantitative model execution (e.g. live trading daemon on VM or paper trading on workstation).
 Attaches to /dev/shm/<name>, loops on 1Hz anchors, reads SeqLock snapshots and feature
 matrices, and outputs structured JSONL telemetry tagged with anchor_ns.
 """
