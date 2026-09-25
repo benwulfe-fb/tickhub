@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -230,7 +234,56 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	_, _ = fmt.Fprintf(w, "# HELP tickhub_recovery_missed_anchors_total Total 1Hz anchors missed during downtime\n")
 	_, _ = fmt.Fprintf(w, "# TYPE tickhub_recovery_missed_anchors_total counter\n")
-	_, _ = fmt.Fprintf(w, "tickhub_recovery_missed_anchors_total %d\n", s.missedAnchors)
+	_, _ = fmt.Fprintf(w, "tickhub_recovery_missed_anchors_total %d\n\n", s.missedAnchors)
+
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+
+	_, _ = fmt.Fprintf(w, "# HELP go_memstats_heap_alloc_bytes Number of heap bytes allocated and still in use\n")
+	_, _ = fmt.Fprintf(w, "# TYPE go_memstats_heap_alloc_bytes gauge\n")
+	_, _ = fmt.Fprintf(w, "go_memstats_heap_alloc_bytes %d\n\n", mem.HeapAlloc)
+
+	_, _ = fmt.Fprintf(w, "# HELP go_memstats_heap_inuse_bytes Heap bytes in in-use spans\n")
+	_, _ = fmt.Fprintf(w, "# TYPE go_memstats_heap_inuse_bytes gauge\n")
+	_, _ = fmt.Fprintf(w, "go_memstats_heap_inuse_bytes %d\n\n", mem.HeapInuse)
+
+	_, _ = fmt.Fprintf(w, "# HELP go_memstats_heap_sys_bytes Heap bytes obtained from system\n")
+	_, _ = fmt.Fprintf(w, "# TYPE go_memstats_heap_sys_bytes gauge\n")
+	_, _ = fmt.Fprintf(w, "go_memstats_heap_sys_bytes %d\n\n", mem.HeapSys)
+
+	_, _ = fmt.Fprintf(w, "# HELP go_memstats_heap_objects_total Total number of allocated objects\n")
+	_, _ = fmt.Fprintf(w, "# TYPE go_memstats_heap_objects_total gauge\n")
+	_, _ = fmt.Fprintf(w, "go_memstats_heap_objects_total %d\n\n", mem.HeapObjects)
+
+	_, _ = fmt.Fprintf(w, "# HELP go_memstats_num_gc Total number of completed GC cycles\n")
+	_, _ = fmt.Fprintf(w, "# TYPE go_memstats_num_gc counter\n")
+	_, _ = fmt.Fprintf(w, "go_memstats_num_gc %d\n\n", mem.NumGC)
+
+	_, _ = fmt.Fprintf(w, "# HELP go_goroutines Number of goroutines currently existing\n")
+	_, _ = fmt.Fprintf(w, "# TYPE go_goroutines gauge\n")
+	_, _ = fmt.Fprintf(w, "go_goroutines %d\n\n", runtime.NumGoroutine())
+
+	if rss := readProcessRSSBytes(); rss > 0 {
+		_, _ = fmt.Fprintf(w, "# HELP tickhub_process_rss_bytes Process Resident Set Size in bytes\n")
+		_, _ = fmt.Fprintf(w, "# TYPE tickhub_process_rss_bytes gauge\n")
+		_, _ = fmt.Fprintf(w, "tickhub_process_rss_bytes %d\n", rss)
+	}
+}
+
+func readProcessRSSBytes() uint64 {
+	data, err := os.ReadFile("/proc/self/statm")
+	if err != nil {
+		return 0
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 2 {
+		return 0
+	}
+	pages, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return pages * uint64(os.Getpagesize())
 }
 
 func (s *Server) handleControlFeed(w http.ResponseWriter, r *http.Request) {

@@ -108,6 +108,13 @@ func TestMetricsServerEndpoints(t *testing.T) {
 		"tickhub_committed_anchors_total 42",
 		"tickhub_recovery_downtime_nanoseconds 500000000",
 		"tickhub_recovery_missed_anchors_total 1",
+		"go_memstats_heap_alloc_bytes",
+		"go_memstats_heap_inuse_bytes",
+		"go_memstats_heap_sys_bytes",
+		"go_memstats_heap_objects_total",
+		"go_memstats_num_gc",
+		"go_goroutines",
+		"tickhub_process_rss_bytes",
 	}
 
 	for _, sub := range expectedSubstrings {
