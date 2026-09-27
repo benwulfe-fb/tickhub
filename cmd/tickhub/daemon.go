@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -143,7 +144,29 @@ func runDaemon(args []string) {
 	allowRecovery := fs.Bool("allow-recovery", true, "Attempt warm/resident recovery if SHM segment exists")
 	noUnlink := fs.Bool("no-unlink", false, "Do not unlink SHM segment on exit")
 	feedEnabled := fs.Bool("feed-enabled", false, "Enable live Massive.com WebSocket feed on boot (default false for safe standby)")
+	timeOffsetStr := fs.String("time-offset", "", "Time offset duration (e.g. -50h30m, -181800s, or integer nanoseconds) to align anchors with replay timeline")
 	fs.Parse(args)
+
+	var timeOffsetNS int64 = 0
+	offsetInput := strings.TrimSpace(*timeOffsetStr)
+	if offsetInput == "" {
+		offsetInput = strings.TrimSpace(os.Getenv("TICKHUB_TIME_OFFSET_NS"))
+	}
+	if offsetInput != "" {
+		if d, err := time.ParseDuration(offsetInput); err == nil {
+			timeOffsetNS = d.Nanoseconds()
+		} else if ns, err := strconv.ParseInt(offsetInput, 10, 64); err == nil {
+			if ns > -1e11 && ns < 1e11 && !strings.HasSuffix(offsetInput, "ns") {
+				timeOffsetNS = ns * 1_000_000_000
+			} else {
+				timeOffsetNS = ns
+			}
+		} else {
+			log.Fatalf("[DAEMON] Invalid --time-offset / TICKHUB_TIME_OFFSET_NS format %q: %v", offsetInput, err)
+		}
+		log.Printf("[DAEMON] Configured time offset: %v (effective virtual now: %s)",
+			time.Duration(timeOffsetNS), time.Now().Add(time.Duration(timeOffsetNS)).Format(time.RFC3339))
+	}
 
 	key := *apiKey
 	if key == "" && *apiKeyFile != "" {
@@ -206,7 +229,7 @@ func runDaemon(args []string) {
 	defer prod.Close()
 
 	projector := project.NewProjector(prod, phaseConfigs, rawCfg.UniqueSymbols, shmCfg.CadenceInterval)
-	projector.SetStartAnchor(time.Now().UnixNano())
+	projector.SetStartAnchor(time.Now().UnixNano() + timeOffsetNS)
 
 	switch recMode {
 	case shm.RecoveryModeWarmSubCadence:
@@ -299,7 +322,7 @@ func runDaemon(args []string) {
 			}
 		case now := <-ticker.C:
 			// Single-threaded event loop: zero data races with tick ingestion
-			nowNS := now.UnixNano()
+			nowNS := now.UnixNano() + timeOffsetNS
 			prod.PublishTelemetry(0, 0, 0, tickCount)
 
 			wallAnchor := (nowNS / cadenceNS) * cadenceNS
