@@ -28,6 +28,8 @@ type Projector struct {
 
 	featBuffer []float64
 
+	snapshots []shm.SymbolSnapshot
+
 	firstCommittedAnchor   int64
 	lastCommittedAnchor    int64
 	totalCommittedFrames   int
@@ -76,6 +78,7 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 		phaseNextAnchor: make([]int64, len(phases)),
 		phaseSlots:      make([]int, len(phases)),
 		featBuffer:      make([]float64, 5),
+		snapshots:       make([]shm.SymbolSnapshot, len(uniqueSymbols)),
 	}
 }
 
@@ -102,6 +105,23 @@ func (p *Projector) SeedState(symbol string, lastBid, lastAsk, lastPrice float64
 		if lastPrice > 0 {
 			hist.UpdateTrade(lastPrice, 0)
 		}
+	}
+	if uIdx, ok := p.symToUnique[symbol]; ok && uIdx >= 0 && uIdx < len(p.snapshots) {
+		snap := &p.snapshots[uIdx]
+		if lastBid > 0 && lastAsk > 0 {
+			snap.BidPx = lastBid
+			snap.AskPx = lastAsk
+			snap.Midprice = (lastBid + lastAsk) / 2.0
+			snap.Spread = lastAsk - lastBid
+		} else if lastBid > 0 {
+			snap.BidPx = lastBid
+		} else if lastAsk > 0 {
+			snap.AskPx = lastAsk
+		}
+		if lastPrice > 0 {
+			snap.LastTradePx = lastPrice
+		}
+		p.producer.WriteSnapshot(uIdx, snap)
 	}
 }
 
@@ -274,10 +294,12 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 }
 
 func (p *Projector) updateSnapshot(uIdx int, tick feed.Tick) {
-	snap := &shm.SymbolSnapshot{
-		SIPTimestampNS:  tick.SIPTimestampNS,
-		RecvTimestampNS: tick.SIPTimestampNS,
+	if uIdx < 0 || uIdx >= len(p.snapshots) {
+		return
 	}
+	snap := &p.snapshots[uIdx]
+	snap.SIPTimestampNS = tick.SIPTimestampNS
+	snap.RecvTimestampNS = tick.SIPTimestampNS
 
 	if tick.Type == feed.TickTrade {
 		snap.LastTradePx = tick.Price

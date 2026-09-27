@@ -205,3 +205,104 @@ func TestProjectorSeedHistoryAndColdStart(t *testing.T) {
 	}
 }
 
+func TestProjectorSnapshotPersistenceAndZeroAlloc(t *testing.T) {
+	phases := []shm.PhaseConfig{
+		{
+			ID:       0,
+			Name:     "phase_0ms",
+			OffsetMS: 0,
+			Symbols:  []string{"AAPL", "MSFT", "SPY"},
+		},
+	}
+	uniqueSymbols := []string{"AAPL", "MSFT", "SPY"}
+	features := []string{"log_ret_1s", "log_ret_5s", "log_ret_15s", "vol_1s", "spread_bps"}
+
+	cfg := shm.Config{
+		Name:            "test_proj_snap",
+		MaxFrames:       32,
+		Phases:          phases,
+		UniqueSymbols:   uniqueSymbols,
+		Features:        features,
+		CadenceInterval: 1 * time.Second,
+		UnlinkOnExit:    true,
+	}
+
+	prod, err := shm.CreateProducer(cfg)
+	if err != nil {
+		t.Fatalf("CreateProducer failed: %v", err)
+	}
+	defer prod.Close()
+
+	proj := NewProjector(prod, phases, uniqueSymbols, 1*time.Second)
+
+	// 1. Seed AAPL
+	proj.SeedState("AAPL", 150.00, 150.10, 149.95)
+	snapAAPL := prod.Snapshot(0)
+	if snapAAPL.BidPx != 150.00 || snapAAPL.AskPx != 150.10 || snapAAPL.Midprice != 150.05 || snapAAPL.LastTradePx != 149.95 {
+		t.Fatalf("SeedState mismatch on AAPL: %+v", snapAAPL)
+	}
+
+	// 2. Ingest Quote on AAPL
+	quoteTick := feed.Tick{
+		SIPTimestampNS: 1700000000_100_000_000,
+		Symbol:         "AAPL",
+		Type:           feed.TickQuote,
+		BidPx:          150.10,
+		AskPx:          150.20,
+		BidSz:          10,
+		AskSz:          20,
+	}
+	_ = proj.IngestTick(quoteTick)
+	snapAAPL = prod.Snapshot(0)
+	if snapAAPL.BidPx != 150.10 || snapAAPL.AskPx != 150.20 || math.Abs(snapAAPL.Midprice-150.15) > 1e-9 {
+		t.Fatalf("Quote update failed: %+v", snapAAPL)
+	}
+	if snapAAPL.LastTradePx != 149.95 {
+		t.Fatalf("Quote update wiped last trade price: %+v", snapAAPL)
+	}
+
+	// 3. Ingest Trade on AAPL
+	tradeTick := feed.Tick{
+		SIPTimestampNS: 1700000000_200_000_000,
+		Symbol:         "AAPL",
+		Type:           feed.TickTrade,
+		Price:          150.18,
+		Size:           100,
+	}
+	_ = proj.IngestTick(tradeTick)
+	snapAAPL = prod.Snapshot(0)
+	if snapAAPL.LastTradePx != 150.18 || snapAAPL.LastTradeSz != 100 {
+		t.Fatalf("Trade update failed: %+v", snapAAPL)
+	}
+	// Regression assertion: trade must NOT wipe bid/ask/mid
+	if snapAAPL.BidPx != 150.10 || snapAAPL.AskPx != 150.20 || math.Abs(snapAAPL.Midprice-150.15) > 1e-9 {
+		t.Fatalf("REGRESSION: Trade tick wiped bid/ask/mid: %+v", snapAAPL)
+	}
+
+	// 4. Ingest on boundary symbol SPY (index len-1 = 2)
+	spyQuote := feed.Tick{
+		SIPTimestampNS: 1700000000_300_000_000,
+		Symbol:         "SPY",
+		Type:           feed.TickQuote,
+		BidPx:          450.00,
+		AskPx:          450.05,
+		BidSz:          50,
+		AskSz:          60,
+	}
+	_ = proj.IngestTick(spyQuote)
+	snapSPY := prod.Snapshot(2)
+	if snapSPY.BidPx != 450.00 || snapSPY.AskPx != 450.05 || math.Abs(snapSPY.Midprice-450.025) > 1e-9 {
+		t.Fatalf("Boundary symbol snapshot mismatch: %+v", snapSPY)
+	}
+
+	// 5. Zero-allocation verification in hot path
+	allocs := testing.AllocsPerRun(1000, func() {
+		proj.updateSnapshot(0, quoteTick)
+		proj.updateSnapshot(0, tradeTick)
+	})
+	if allocs != 0 {
+		t.Fatalf("Expected 0 allocs in updateSnapshot, got %f", allocs)
+	}
+}
+
+
