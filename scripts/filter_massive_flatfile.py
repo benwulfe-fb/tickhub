@@ -11,6 +11,7 @@ Memory complexity: O(1) via streaming generator merge.
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
 import heapq
 import logging
@@ -41,17 +42,17 @@ def load_universe(config_path: str | Path) -> set[str]:
 def trade_generator(trades_path: str | Path, symbols: set[str], max_rows: int = -1):
     count = 0
     with gzip.open(trades_path, "rt", encoding="utf-8") as f:
-        header = f.readline().strip().split(",")
+        reader = csv.reader(f)
         try:
+            header = next(reader)
             sym_idx = header.index("ticker")
             ts_idx = header.index("sip_timestamp")
             px_idx = header.index("price")
             sz_idx = header.index("size")
-        except ValueError as e:
-            raise ValueError(f"Unexpected trades header in {trades_path}: {header}") from e
+        except (StopIteration, ValueError) as e:
+            raise ValueError(f"Unexpected trades header in {trades_path}: {e}") from e
 
-        for line in f:
-            parts = line.strip().split(",")
+        for parts in reader:
             if len(parts) <= max(sym_idx, ts_idx, px_idx, sz_idx):
                 continue
             sym = parts[sym_idx]
@@ -73,19 +74,19 @@ def trade_generator(trades_path: str | Path, symbols: set[str], max_rows: int = 
 def quote_generator(quotes_path: str | Path, symbols: set[str], max_rows: int = -1):
     count = 0
     with gzip.open(quotes_path, "rt", encoding="utf-8") as f:
-        header = f.readline().strip().split(",")
+        reader = csv.reader(f)
         try:
+            header = next(reader)
             sym_idx = header.index("ticker")
             ts_idx = header.index("sip_timestamp")
             bp_idx = header.index("bid_price")
             bs_idx = header.index("bid_size")
             ap_idx = header.index("ask_price")
             as_idx = header.index("ask_size")
-        except ValueError as e:
-            raise ValueError(f"Unexpected quotes header in {quotes_path}: {header}") from e
+        except (StopIteration, ValueError) as e:
+            raise ValueError(f"Unexpected quotes header in {quotes_path}: {e}") from e
 
-        for line in f:
-            parts = line.strip().split(",")
+        for parts in reader:
             if len(parts) <= max(sym_idx, ts_idx, bp_idx, bs_idx, ap_idx, as_idx):
                 continue
             sym = parts[sym_idx]
