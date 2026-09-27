@@ -83,15 +83,22 @@ class FlatFileWSServer:
                     if params:
                         # Extract subscribed symbols, e.g. "Q.AAPL,T.AAPL,Q.MSFT" -> {"AAPL", "MSFT"}
                         syms = set()
+                        wildcard = False
                         for p in params.split(","):
                             p = p.strip()
+                            if p == "*" or p.endswith(".*"):
+                                wildcard = True
+                                break
                             if "." in p:
                                 syms.add(p.split(".", 1)[1])
                             elif p:
                                 syms.add(p)
-                        if syms:
+                        if not wildcard and syms:
                             target_symbols = syms
                             logger.info(f"[WS-SERVER] Subscribed to {len(syms)} specific symbols: {sorted(syms)[:10]}...")
+                        else:
+                            target_symbols = None
+                            logger.info("[WS-SERVER] Subscribed to all symbols in flat file")
 
                     subscribed = True
                     resp = [{"ev": "status", "status": "success", "message": "subscribed"}]
@@ -157,9 +164,6 @@ class FlatFileWSServer:
                     return
 
                 # Paced real-time streaming loop
-                stream_start_wall = time.time()  # reset wall clock baseline after seek
-                virtual_start_ns = t_ns           # pin baseline to actual first record
-
                 while line:
                     parts = line.strip().split(",")
                     if len(parts) >= 9:
@@ -169,10 +173,10 @@ class FlatFileWSServer:
                         if target_symbols is None or sym in target_symbols:
                             try:
                                 t_ns = int(parts[2])
-                                event_virtual_offset_s = (t_ns - virtual_start_ns) / 1e9
-                                target_wall_time = stream_start_wall + (event_virtual_offset_s / self.speed)
+                                event_vtime_s = t_ns / 1e9
+                                target_wall_time = event_vtime_s - self.time_offset_s
                                 now = time.time()
-                                sleep_duration = target_wall_time - now
+                                sleep_duration = (target_wall_time - now) / self.speed
 
                                 if sleep_duration > 0.0005:
                                     if batch:
