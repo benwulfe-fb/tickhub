@@ -61,6 +61,82 @@ func TestParseMassiveEvents(t *testing.T) {
 	}
 }
 
+func TestParseMassiveEvents_TradesAndStrings(t *testing.T) {
+	// 1. Verbatim wire frame with string ds: "40.0"
+	rawStringDS := `[{"ev":"T","sym":"AAPL","i":"143541","x":4,"p":297.845,"s":40,"t":1781622376036,"pt":1781622376029,"q":4938312,"z":3,"trfi":202,"trft":1781622376036,"ds":"40.0"}]`
+	ticks, err := ParseMassiveEvents([]byte(rawStringDS))
+	if err != nil {
+		t.Fatalf("Failed to parse string ds: %v", err)
+	}
+	if len(ticks) != 1 {
+		t.Fatalf("expected 1 tick, got %d", len(ticks))
+	}
+	if ticks[0].Type != TickTrade || ticks[0].Price != 297.845 || ticks[0].Size != 40.0 || ticks[0].Symbol != "AAPL" {
+		t.Errorf("mismatch on string ds tick: %+v", ticks[0])
+	}
+
+	// 2. Fractional shares string ds: "0.740474"
+	rawFractional := `[{"ev":"T","sym":"QQQ","p":744.15,"s":1,"ds":"0.740474","t":1790341395094}]`
+	ticks, err = ParseMassiveEvents([]byte(rawFractional))
+	if err != nil {
+		t.Fatalf("Failed to parse fractional ds: %v", err)
+	}
+	if len(ticks) != 1 || ticks[0].Size != 0.740474 {
+		t.Errorf("mismatch on fractional ds tick: %+v", ticks)
+	}
+
+	// 3. Fallback to s when ds is omitted or 0
+	rawOmittedDS := `[{"ev":"T","sym":"SPY","p":765.5,"s":120,"t":1790341395000}]`
+	ticks, err = ParseMassiveEvents([]byte(rawOmittedDS))
+	if err != nil {
+		t.Fatalf("Failed to parse omitted ds: %v", err)
+	}
+	if len(ticks) != 1 || ticks[0].Size != 120.0 {
+		t.Errorf("mismatch on omitted ds tick: %+v", ticks)
+	}
+
+	// 4. Single JSON object {...}
+	rawSingle := `{"ev":"T","sym":"NVDA","p":120.0,"s":50,"ds":"50.0","t":1790341395100}`
+	ticks, err = ParseMassiveEvents([]byte(rawSingle))
+	if err != nil {
+		t.Fatalf("Failed to parse single json object: %v", err)
+	}
+	if len(ticks) != 1 || ticks[0].Symbol != "NVDA" || ticks[0].Size != 50.0 {
+		t.Errorf("mismatch on single json object: %+v", ticks)
+	}
+
+	// 5. Status event (should not emit market ticks)
+	rawStatus := `[{"ev":"status","status":"success","message":"subscribed to: Q.AAPL, T.AAPL"}]`
+	ticks, err = ParseMassiveEvents([]byte(rawStatus))
+	if err != nil {
+		t.Fatalf("Failed to parse status event: %v", err)
+	}
+	if len(ticks) != 0 {
+		t.Errorf("expected 0 ticks for status event, got %d", len(ticks))
+	}
+
+	// 6. Invalid trades with price <= 0, size <= 0, or timestamp <= 0 should be dropped
+	rawInvalid := `[
+		{"ev":"T","sym":"BAD1","p":0.0,"s":10,"ds":"10.0","t":1790341395000},
+		{"ev":"T","sym":"BAD2","p":100.0,"s":0,"ds":"0.0","t":1790341395000},
+		{"ev":"T","sym":"BAD3","p":100.0,"s":10,"ds":"10.0","t":0}
+	]`
+	ticks, err = ParseMassiveEvents([]byte(rawInvalid))
+	if err != nil {
+		t.Fatalf("Failed to parse rawInvalid: %v", err)
+	}
+	if len(ticks) != 0 {
+		t.Errorf("expected 0 ticks for invalid trades, got %d", len(ticks))
+	}
+
+	// 7. Non-numeric invalid string in ds should return error
+	rawGarbage := `[{"ev":"T","sym":"AAPL","p":100.0,"s":10,"ds":"NOT_A_NUMBER","t":1790341395000}]`
+	_, err = ParseMassiveEvents([]byte(rawGarbage))
+	if err == nil {
+		t.Errorf("expected error on non-numeric ds string, got nil")
+	}
+}
+
 func TestMassiveWSClientMockServer(t *testing.T) {
 	upgrader := websocket.Upgrader{}
 

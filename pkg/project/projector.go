@@ -317,6 +317,7 @@ func (p *Projector) updateSnapshot(uIdx int, tick feed.Tick) {
 	if tick.Type == feed.TickTrade {
 		snap.LastTradePx = tick.Price
 		snap.LastTradeSz = tick.Size
+		snap.Conditions++
 	} else {
 		snap.BidPx = tick.BidPx
 		snap.AskPx = tick.AskPx

@@ -274,9 +274,45 @@ func TestProjectorSnapshotPersistenceAndZeroAlloc(t *testing.T) {
 	if snapAAPL.LastTradePx != 150.18 || snapAAPL.LastTradeSz != 100 {
 		t.Fatalf("Trade update failed: %+v", snapAAPL)
 	}
+	if snapAAPL.Conditions != 1 {
+		t.Fatalf("Expected Conditions == 1 on trade, got %d", snapAAPL.Conditions)
+	}
 	// Regression assertion: trade must NOT wipe bid/ask/mid
 	if snapAAPL.BidPx != 150.10 || snapAAPL.AskPx != 150.20 || math.Abs(snapAAPL.Midprice-150.15) > 1e-9 {
 		t.Fatalf("REGRESSION: Trade tick wiped bid/ask/mid: %+v", snapAAPL)
+	}
+
+	// Subsequent quote must NOT increment Conditions and must NOT wipe last trade
+	quote2 := feed.Tick{
+		SIPTimestampNS: 1700000000_250_000_000,
+		Symbol:         "AAPL",
+		Type:           feed.TickQuote,
+		BidPx:          150.12,
+		AskPx:          150.22,
+		BidSz:          12,
+		AskSz:          22,
+	}
+	_ = proj.IngestTick(quote2)
+	snapAAPL = prod.Snapshot(0)
+	if snapAAPL.Conditions != 1 {
+		t.Fatalf("Quote must not increment Conditions: got %d", snapAAPL.Conditions)
+	}
+	if snapAAPL.LastTradePx != 150.18 || snapAAPL.LastTradeSz != 100 {
+		t.Fatalf("Quote wiped last trade: %+v", snapAAPL)
+	}
+
+	// Second trade must increment Conditions to 2
+	tradeTick2 := feed.Tick{
+		SIPTimestampNS: 1700000000_260_000_000,
+		Symbol:         "AAPL",
+		Type:           feed.TickTrade,
+		Price:          150.19,
+		Size:           50,
+	}
+	_ = proj.IngestTick(tradeTick2)
+	snapAAPL = prod.Snapshot(0)
+	if snapAAPL.Conditions != 2 {
+		t.Fatalf("Expected Conditions == 2 on second trade, got %d", snapAAPL.Conditions)
 	}
 
 	// 4. Ingest on boundary symbol SPY (index len-1 = 2)
