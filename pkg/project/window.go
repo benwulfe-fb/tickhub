@@ -17,8 +17,21 @@ type SymbolHistory struct {
 	lastBid     float64
 	lastAsk     float64
 	currentVol  float64
+	spreadBps   float64
 	hasTraded   bool
 	initialized bool
+}
+
+func (h *SymbolHistory) recalcSpread() {
+	px := h.lastPrice
+	if px <= 0 {
+		px = 100.0
+	}
+	if h.lastBid > 0 && h.lastAsk > 0 && px > 0 {
+		h.spreadBps = ((h.lastAsk - h.lastBid) / px) * 10000.0
+	} else {
+		h.spreadBps = 1.0 // default minimum 1 bps
+	}
 }
 
 func (h *SymbolHistory) UpdateQuote(bid, ask float64) {
@@ -37,12 +50,14 @@ func (h *SymbolHistory) UpdateQuote(bid, ask float64) {
 			h.lastPrice = h.lastAsk
 		}
 	}
+	h.recalcSpread()
 }
 
 func (h *SymbolHistory) UpdateTrade(price, size float64) {
 	if price > 0 {
 		h.lastPrice = price
 		h.hasTraded = true
+		h.recalcSpread()
 	}
 	if size > 0 {
 		h.currentVol += size
@@ -57,6 +72,7 @@ func (h *SymbolHistory) CloseBar(slot int) (logRet1s, logRet5s, logRet15s, vol1s
 		// Default fallback if uninitialized
 		px = 100.0
 		h.lastPrice = px
+		h.recalcSpread()
 	}
 
 	h.prices[currSlot] = px
@@ -65,10 +81,10 @@ func (h *SymbolHistory) CloseBar(slot int) (logRet1s, logRet5s, logRet15s, vol1s
 	h.currentVol = 0 // Reset volume for next 1-second interval
 
 	// Spread in basis points
-	if h.lastBid > 0 && h.lastAsk > 0 && px > 0 {
-		spreadBps = ((h.lastAsk - h.lastBid) / px) * 10000.0
-	} else {
-		spreadBps = 1.0 // default minimum 1 bps
+	spreadBps = h.spreadBps
+	if spreadBps <= 0 {
+		h.recalcSpread()
+		spreadBps = h.spreadBps
 	}
 
 	if !h.initialized {
@@ -84,21 +100,33 @@ func (h *SymbolHistory) CloseBar(slot int) (logRet1s, logRet5s, logRet15s, vol1s
 	prev1Slot := (slot - 1 + maxHistoryBars) % maxHistoryBars
 	p1 := h.prices[prev1Slot]
 	if p1 > 0 {
-		logRet1s = math.Log(px / p1)
+		if px == p1 {
+			logRet1s = 0.0
+		} else {
+			logRet1s = math.Log(px / p1)
+		}
 	}
 
 	// 5-second log return: ln(P_T / P_{T-5})
 	prev5Slot := (slot - 5 + maxHistoryBars) % maxHistoryBars
 	p5 := h.prices[prev5Slot]
 	if p5 > 0 {
-		logRet5s = math.Log(px / p5)
+		if px == p5 {
+			logRet5s = 0.0
+		} else {
+			logRet5s = math.Log(px / p5)
+		}
 	}
 
 	// 15-second log return: ln(P_T / P_{T-15})
 	prev15Slot := (slot - 15 + maxHistoryBars) % maxHistoryBars
 	p15 := h.prices[prev15Slot]
 	if p15 > 0 {
-		logRet15s = math.Log(px / p15)
+		if px == p15 {
+			logRet15s = 0.0
+		} else {
+			logRet15s = math.Log(px / p15)
+		}
 	}
 
 	return logRet1s, logRet5s, logRet15s, vol1s, spreadBps
@@ -124,6 +152,7 @@ func (h *SymbolHistory) SeedFromBars(lastPx, lastBid, lastAsk float64, bars []sh
 	}
 	h.hasTraded = true
 	h.initialized = true
+	h.recalcSpread()
 
 	px := lastPx
 	for i := len(bars) - 1; i >= 0; i-- {
@@ -162,6 +191,7 @@ func (h *SymbolHistory) SeedPrevailingPrice(lastPx, lastBid, lastAsk float64) {
 	}
 	h.hasTraded = true
 	h.initialized = true
+	h.recalcSpread()
 	for i := 0; i < maxHistoryBars; i++ {
 		h.prices[i] = lastPx
 	}

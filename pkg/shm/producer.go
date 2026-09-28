@@ -500,6 +500,60 @@ func (p *Producer) CommitSymbolMetrics(phaseIdx int, symbolPhaseIdx int, anchorN
 	return nil
 }
 
+// CommitPhaseFrame writes all feature float64 values and atomic symbol anchors for all symbols in a phase at anchorNS
+// in a single contiguous write with strict store-release visibility ordering.
+func (p *Producer) CommitPhaseFrame(phaseIdx int, anchorNS int64, features []float64) error {
+	if phaseIdx < 0 || phaseIdx >= len(p.phaseOffsets) {
+		return fmt.Errorf("invalid phase index %d", phaseIdx)
+	}
+
+	// In replay mode, throttle on phase 0
+	if phaseIdx == 0 {
+		if err := p.WaitConsumerAdvance(anchorNS, 10*time.Second); err != nil {
+			return err
+		}
+	}
+
+	cadenceNS := int64(p.header.CadenceInterval)
+	if cadenceNS <= 0 {
+		cadenceNS = int64(time.Second)
+	}
+
+	slot := uint32((anchorNS / cadenceNS) & int64(p.header.MaxFrames-1))
+	frameOffset := p.phaseOffsets[phaseIdx] + uintptr(slot)*p.phaseStrides[phaseIdx]
+	raw := p.segment.Bytes()
+
+	nSym := uintptr(p.header.Phases[phaseIdx].NumSymbols)
+	nFeat := uintptr(p.header.Phases[phaseIdx].NumFeatures)
+
+	// Stage 1: FrameHeader metadata initialization (AnchorNS is NOT updated here)
+	frameHdr := (*FrameHeader)(unsafe.Pointer(&raw[frameOffset]))
+	frameHdr.StartTimestampNS = anchorNS - cadenceNS
+	frameHdr.EndTimestampNS = anchorNS
+	frameHdr.NumSymbols = uint32(nSym)
+	frameHdr.NumFeatures = uint32(nFeat)
+	atomic.StoreUint32(&frameHdr.Flags, 0)
+
+	// Stage 2: Vectorized bulk copy of contiguous features
+	totalFloats := nSym * nFeat
+	if totalFloats > 0 && len(features) >= int(totalFloats) {
+		featOffset := frameOffset + 64 + nSym*8
+		featSlice := unsafe.Slice((*float64)(unsafe.Pointer(&raw[featOffset])), totalFloats)
+		copy(featSlice, features[:totalFloats])
+	}
+
+	// Stage 3: Sequential Store-Release of per-symbol anchors
+	anchorBaseOffset := frameOffset + 64
+	for sIdx := uintptr(0); sIdx < nSym; sIdx++ {
+		anchorPtr := (*int64)(unsafe.Pointer(&raw[anchorBaseOffset+sIdx*8]))
+		atomic.StoreInt64(anchorPtr, anchorNS)
+	}
+
+	// Stage 4: Store-Release FrameHeader.AnchorNS LAST
+	atomic.StoreInt64(&frameHdr.AnchorNS, anchorNS)
+	return nil
+}
+
 // CommitFrameFinalizeWithLatency marks the overall frame committed, records publish latency, and updates last_written_anchor_ns.
 func (p *Producer) CommitFrameFinalizeWithLatency(anchorNS, publishLatNS int64) {
 	if atomic.LoadInt64(&p.header.FirstAnchorNS) == 0 {

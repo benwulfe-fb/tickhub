@@ -26,7 +26,8 @@ type Projector struct {
 	phaseNextAnchor []int64
 	phaseSlots      []int
 
-	featBuffer []float64
+	featBuffer       []float64
+	phaseFeatBuffers [][]float64
 
 	snapshots []shm.SymbolSnapshot
 
@@ -56,8 +57,17 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 	histories := make([][]*SymbolHistory, len(phases))
 	symbolPhaseRefs := make(map[string][]phaseRef)
 
+	phaseFeatBuffers := make([][]float64, len(phases))
 	for pIdx, p := range phases {
 		histories[pIdx] = make([]*SymbolHistory, len(p.Symbols))
+		nFeat := 5
+		if producer != nil && pIdx < len(producer.Header().Phases) {
+			hdrFeat := int(producer.Header().Phases[pIdx].NumFeatures)
+			if hdrFeat > 0 {
+				nFeat = hdrFeat
+			}
+		}
+		phaseFeatBuffers[pIdx] = make([]float64, len(p.Symbols)*nFeat)
 		for sIdx, s := range p.Symbols {
 			histories[pIdx][sIdx] = &SymbolHistory{}
 			symbolPhaseRefs[s] = append(symbolPhaseRefs[s], phaseRef{
@@ -68,17 +78,18 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 	}
 
 	return &Projector{
-		producer:        producer,
-		cadenceNS:       cadenceNS,
-		phases:          phases,
-		uniqueSymbols:   uniqueSymbols,
-		symToUnique:     symToUnique,
-		histories:       histories,
-		symbolPhaseRefs: symbolPhaseRefs,
-		phaseNextAnchor: make([]int64, len(phases)),
-		phaseSlots:      make([]int, len(phases)),
-		featBuffer:      make([]float64, 5),
-		snapshots:       make([]shm.SymbolSnapshot, len(uniqueSymbols)),
+		producer:         producer,
+		cadenceNS:        cadenceNS,
+		phases:           phases,
+		uniqueSymbols:    uniqueSymbols,
+		symToUnique:      symToUnique,
+		histories:        histories,
+		symbolPhaseRefs:  symbolPhaseRefs,
+		phaseNextAnchor:  make([]int64, len(phases)),
+		phaseSlots:       make([]int, len(phases)),
+		featBuffer:       make([]float64, 5),
+		phaseFeatBuffers: phaseFeatBuffers,
+		snapshots:        make([]shm.SymbolSnapshot, len(uniqueSymbols)),
 	}
 }
 
@@ -259,20 +270,22 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 	startNS := time.Now().UnixNano()
 	pCfg := p.phases[pIdx]
 	slot := p.phaseSlots[pIdx]
+	featBuf := p.phaseFeatBuffers[pIdx]
 
 	for sIdx := range pCfg.Symbols {
 		hist := p.histories[pIdx][sIdx]
 		r1, r5, r15, v1, sp := hist.CloseBar(slot)
 
-		p.featBuffer[0] = r1
-		p.featBuffer[1] = r5
-		p.featBuffer[2] = r15
-		p.featBuffer[3] = v1
-		p.featBuffer[4] = sp
+		base := sIdx * 5
+		featBuf[base] = r1
+		featBuf[base+1] = r5
+		featBuf[base+2] = r15
+		featBuf[base+3] = v1
+		featBuf[base+4] = sp
+	}
 
-		if err := p.producer.CommitSymbolMetrics(pIdx, sIdx, anchorNS, p.featBuffer); err != nil {
-			return fmt.Errorf("commit metrics p%d s%d @ %d: %w", pIdx, sIdx, anchorNS, err)
-		}
+	if err := p.producer.CommitPhaseFrame(pIdx, anchorNS, featBuf); err != nil {
+		return fmt.Errorf("commit phase frame p%d @ %d: %w", pIdx, anchorNS, err)
 	}
 
 	if p.coldStartBarsRemaining > 0 {

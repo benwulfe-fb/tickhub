@@ -145,7 +145,17 @@ func runDaemon(args []string) {
 	noUnlink := fs.Bool("no-unlink", false, "Do not unlink SHM segment on exit")
 	feedEnabled := fs.Bool("feed-enabled", false, "Enable live Massive.com WebSocket feed on boot (default false for safe standby)")
 	timeOffsetStr := fs.String("time-offset", "", "Time offset duration (e.g. -50h30m, -181800s, or integer nanoseconds) to align anchors with replay timeline")
+	watermarkBufferStr := fs.String("watermark-buffer", "50ms", "Watermark latency buffer before committing frames on tick streams")
 	fs.Parse(args)
+
+	var watermarkBufferNS int64 = 50_000_000
+	if *watermarkBufferStr != "" {
+		if d, err := time.ParseDuration(*watermarkBufferStr); err == nil {
+			watermarkBufferNS = d.Nanoseconds()
+		} else {
+			log.Fatalf("[DAEMON] Invalid --watermark-buffer %q: %v", *watermarkBufferStr, err)
+		}
+	}
 
 	var timeOffsetNS int64 = 0
 	offsetInput := strings.TrimSpace(*timeOffsetStr)
@@ -300,7 +310,7 @@ func runDaemon(args []string) {
 	startTime := time.Now()
 	lastReport := time.Now()
 
-	ticker := time.NewTicker(250 * time.Millisecond)
+	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 
 	cadenceNS := shmCfg.CadenceInterval.Nanoseconds()
@@ -323,7 +333,7 @@ func runDaemon(args []string) {
 		case now := <-ticker.C:
 			// Single-threaded event loop: zero data races with tick ingestion
 			nowNS := now.UnixNano() + timeOffsetNS
-			prod.PublishTelemetry(0, 0, 0, tickCount)
+			prod.PublishTelemetry(0, watermarkBufferNS, 0, tickCount)
 
 			wallAnchor := (nowNS / cadenceNS) * cadenceNS
 			if wallAnchor > lastFlushedAnchor {

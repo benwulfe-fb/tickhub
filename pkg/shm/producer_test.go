@@ -351,5 +351,115 @@ func TestProducerConfigPublication(t *testing.T) {
 	}
 }
 
+func TestCommitPhaseFrameBulk(t *testing.T) {
+	symbols := []string{"AAPL", "MSFT", "NVDA"}
+	features := []string{"r1", "r5", "r15", "vol", "spread"}
+	phases := []PhaseConfig{
+		{ID: 0, Name: "phase_p0", OffsetMS: 0, Symbols: symbols},
+	}
+	cfg := Config{
+		Name:            "test_bulk_frame",
+		MaxFrames:       16,
+		Phases:          phases,
+		UniqueSymbols:   symbols,
+		Features:        features,
+		CadenceInterval: 1 * time.Second,
+		UnlinkOnExit:    true,
+	}
+
+	prod, err := CreateProducer(cfg)
+	if err != nil {
+		t.Fatalf("CreateProducer failed: %v", err)
+	}
+	defer prod.Close()
+
+	anchor := int64(1700000000_000_000_000)
+	bulkFeatures := []float64{
+		0.01, 0.05, 0.15, 100.0, 1.5, // AAPL
+		0.02, 0.06, 0.16, 200.0, 2.5, // MSFT
+		0.03, 0.07, 0.17, 300.0, 3.5, // NVDA
+	}
+
+	if err := prod.CommitPhaseFrame(0, anchor, bulkFeatures); err != nil {
+		t.Fatalf("CommitPhaseFrame failed: %v", err)
+	}
+	prod.CommitFrameFinalize(anchor)
+
+	// Verify FrameHeader layout and values
+	cadenceNS := int64(time.Second)
+	slot := uint32((anchor / cadenceNS) & 15)
+	frameOffset := prod.phaseOffsets[0] + uintptr(slot)*prod.phaseStrides[0]
+	raw := prod.segment.Bytes()
+
+	hdr := (*FrameHeader)(unsafe.Pointer(&raw[frameOffset]))
+	if hdr.AnchorNS != anchor {
+		t.Fatalf("expected AnchorNS %d, got %d", anchor, hdr.AnchorNS)
+	}
+	if hdr.StartTimestampNS != anchor-cadenceNS {
+		t.Fatalf("expected StartTimestampNS %d, got %d", anchor-cadenceNS, hdr.StartTimestampNS)
+	}
+	if hdr.EndTimestampNS != anchor {
+		t.Fatalf("expected EndTimestampNS %d, got %d", anchor, hdr.EndTimestampNS)
+	}
+	if hdr.NumSymbols != 3 {
+		t.Fatalf("expected NumSymbols 3, got %d", hdr.NumSymbols)
+	}
+	if hdr.NumFeatures != 5 {
+		t.Fatalf("expected NumFeatures 5, got %d", hdr.NumFeatures)
+	}
+
+	// Verify per-symbol anchors (each symbol anchor is 8 bytes at frameOffset + 64 + sIdx*8)
+	for s := 0; s < 3; s++ {
+		anchorPtr := (*int64)(unsafe.Pointer(&raw[frameOffset+64+uintptr(s)*8]))
+		if *anchorPtr != anchor {
+			t.Fatalf("symbol %d anchor expected %d, got %d", s, anchor, *anchorPtr)
+		}
+	}
+
+	// Verify feature values at frameOffset + 64 + nSym*8 + sIdx*nFeat*8
+	for s := 0; s < 3; s++ {
+		for f := 0; f < 5; f++ {
+			featOffset := frameOffset + 64 + 3*8 + uintptr(s*5+f)*8
+			val := *(*float64)(unsafe.Pointer(&raw[featOffset]))
+			expected := bulkFeatures[s*5+f]
+			if val != expected {
+				t.Fatalf("symbol %d feat %d: expected %f, got %f", s, f, expected, val)
+			}
+		}
+	}
+
+	// Parity verification with CommitSymbolMetrics at slot+1
+	anchorNext := anchor + cadenceNS
+	slotNext := uint32((anchorNext / cadenceNS) & 15)
+	frameOffsetNext := prod.phaseOffsets[0] + uintptr(slotNext)*prod.phaseStrides[0]
+
+	for s := 0; s < 3; s++ {
+		feats := bulkFeatures[s*5 : (s+1)*5]
+		if err := prod.CommitSymbolMetrics(0, s, anchorNext, feats); err != nil {
+			t.Fatalf("CommitSymbolMetrics failed: %v", err)
+		}
+	}
+
+	// FrameHeader and feature bytes at frameOffsetNext must match frameOffset layout bit-for-bit
+	hdrNext := (*FrameHeader)(unsafe.Pointer(&raw[frameOffsetNext]))
+	if hdrNext.AnchorNS != anchorNext || hdrNext.NumSymbols != 3 || hdrNext.NumFeatures != 5 {
+		t.Fatalf("CommitSymbolMetrics header mismatch")
+	}
+	for s := 0; s < 3; s++ {
+		anchorNextPtr := (*int64)(unsafe.Pointer(&raw[frameOffsetNext+64+uintptr(s)*8]))
+		if *anchorNextPtr != anchorNext {
+			t.Fatalf("CommitSymbolMetrics anchor %d expected %d, got %d", s, anchorNext, *anchorNextPtr)
+		}
+		for f := 0; f < 5; f++ {
+			featOffset := frameOffsetNext + 64 + 3*8 + uintptr(s*5+f)*8
+			val := *(*float64)(unsafe.Pointer(&raw[featOffset]))
+			expected := bulkFeatures[s*5+f]
+			if val != expected {
+				t.Fatalf("CommitSymbolMetrics symbol %d feat %d: expected %f, got %f", s, f, expected, val)
+			}
+		}
+	}
+}
+
 
 

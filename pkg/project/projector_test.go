@@ -305,4 +305,114 @@ func TestProjectorSnapshotPersistenceAndZeroAlloc(t *testing.T) {
 	}
 }
 
+func TestProjectorBulkCommitAndZeroAlloc(t *testing.T) {
+	nSym := 72
+	symbols := make([]string, nSym)
+	for i := 0; i < nSym; i++ {
+		symbols[i] = "SYM" + string(rune('A'+i/26)) + string(rune('A'+i%26))
+	}
+	phases := []shm.PhaseConfig{
+		{ID: 0, Name: "p0", OffsetMS: 0, Symbols: symbols},
+	}
+	features := []string{"log_ret_1s", "log_ret_5s", "log_ret_15s", "vol_1s", "spread_bps"}
+	cfg := shm.Config{
+		Name:            "test_proj_bulk_alloc",
+		MaxFrames:       64,
+		Phases:          phases,
+		UniqueSymbols:   symbols,
+		Features:        features,
+		CadenceInterval: 1 * time.Second,
+		UnlinkOnExit:    true,
+	}
+
+	prod, err := shm.CreateProducer(cfg)
+	if err != nil {
+		t.Fatalf("CreateProducer failed: %v", err)
+	}
+	defer prod.Close()
+
+	proj := NewProjector(prod, phases, symbols, 1*time.Second)
+	t0 := int64(1700000000_000_000_000)
+	proj.SetStartAnchor(t0)
+
+	// Seed all symbols
+	for _, s := range symbols {
+		proj.SeedPrevailingPrice(s, 100.0, 100.0, 100.10)
+	}
+
+	// First bar: warm up history
+	_ = proj.Flush(t0)
+
+	// Second bar: move price on SYM0 (first symbol), leave SYM1 unchanged
+	_ = proj.IngestTick(feed.Tick{
+		SIPTimestampNS: t0 + 100_000_000,
+		Symbol:         symbols[0],
+		Type:           feed.TickTrade,
+		Price:          105.0,
+		Size:           50.0,
+	})
+	_ = proj.Flush(t0 + 1_000_000_000)
+
+	// Check SHM frame layout directly
+	raw := prod.Bytes()
+	slot1 := uint32(((t0 + 1_000_000_000) / int64(time.Second)) & 63)
+	hdr := prod.Header()
+	frameOffset := hdr.Phases[0].RingOffsetBytes + uint64(slot1)*hdr.Phases[0].FrameStrideBytes
+
+	// Symbol 0 return should be ln(105 / 100)
+	expectedR1Sym0 := math.Log(105.0 / 100.0)
+	feat0Offset := frameOffset + 64 + uint64(nSym)*8
+	val0 := math.Float64frombits(uint64(raw[feat0Offset]) |
+		uint64(raw[feat0Offset+1])<<8 |
+		uint64(raw[feat0Offset+2])<<16 |
+		uint64(raw[feat0Offset+3])<<24 |
+		uint64(raw[feat0Offset+4])<<32 |
+		uint64(raw[feat0Offset+5])<<40 |
+		uint64(raw[feat0Offset+6])<<48 |
+		uint64(raw[feat0Offset+7])<<56)
+	if math.Abs(val0-expectedR1Sym0) > 1e-12 {
+		t.Fatalf("expected sym0 return %f, got %f", expectedR1Sym0, val0)
+	}
+
+	// Symbol 1 return should be exact 0.0 (fast-path zero return on unchanged price)
+	feat1Offset := frameOffset + 64 + uint64(nSym)*8 + 5*8
+	val1 := math.Float64frombits(uint64(raw[feat1Offset]) |
+		uint64(raw[feat1Offset+1])<<8 |
+		uint64(raw[feat1Offset+2])<<16 |
+		uint64(raw[feat1Offset+3])<<24 |
+		uint64(raw[feat1Offset+4])<<32 |
+		uint64(raw[feat1Offset+5])<<40 |
+		uint64(raw[feat1Offset+6])<<48 |
+		uint64(raw[feat1Offset+7])<<56)
+	if val1 != 0.0 {
+		t.Fatalf("expected sym1 return 0.0 on unchanged price, got %f", val1)
+	}
+
+	// Verify symbol anchors in SHM
+	for s := 0; s < nSym; s++ {
+		anchorOffset := frameOffset + 64 + uint64(s*8)
+		anchorVal := int64(uint64(raw[anchorOffset]) |
+			uint64(raw[anchorOffset+1])<<8 |
+			uint64(raw[anchorOffset+2])<<16 |
+			uint64(raw[anchorOffset+3])<<24 |
+			uint64(raw[anchorOffset+4])<<32 |
+			uint64(raw[anchorOffset+5])<<40 |
+			uint64(raw[anchorOffset+6])<<48 |
+			uint64(raw[anchorOffset+7])<<56)
+		if anchorVal != t0+1_000_000_000 {
+			t.Fatalf("symbol %d anchor mismatch: expected %d, got %d", s, t0+1_000_000_000, anchorVal)
+		}
+	}
+
+	// Zero-allocation test: closePhase across 72 symbols must allocate 0 heap bytes
+	curAnchor := t0 + 2_000_000_000
+	allocs := testing.AllocsPerRun(1000, func() {
+		_ = proj.closePhase(0, curAnchor)
+		curAnchor += 1_000_000_000
+	})
+	if allocs != 0 {
+		t.Fatalf("closePhase allocated on heap: %f allocs/run (expected 0)", allocs)
+	}
+}
+
 
