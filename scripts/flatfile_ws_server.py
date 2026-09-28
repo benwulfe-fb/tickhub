@@ -39,12 +39,14 @@ class FlatFileWSServer:
         speed: float = 1.0,
         host: str = "0.0.0.0",
         port: int = 8765,
+        virtual_start_ns: int | None = None,
     ):
         self.flatfile_path = Path(flatfile_path)
         self.time_offset_s = float(time_offset_s)
         self.speed = float(speed)
         self.host = host
         self.port = int(port)
+        self.virtual_start_ns = virtual_start_ns
         self.running = True
 
         if not self.flatfile_path.exists():
@@ -115,7 +117,10 @@ class FlatFileWSServer:
         # 2. Fast-Forward and Streaming Phase
         open_fn = gzip.open if str(self.flatfile_path).endswith(".gz") else open
         stream_start_wall = time.time()
-        virtual_start_ns = int((stream_start_wall + self.time_offset_s) * 1e9)
+        if self.virtual_start_ns is not None:
+            virtual_start_ns = int(self.virtual_start_ns)
+        else:
+            virtual_start_ns = int((stream_start_wall + self.time_offset_s) * 1e9)
         v_start_iso = datetime.datetime.fromtimestamp(
             virtual_start_ns / 1e9, tz=datetime.timezone.utc
         ).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -252,6 +257,7 @@ def main():
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier (default: 1.0)")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8765, help="Port to listen on (default: 8765)")
+    parser.add_argument("--virtual-start-ns", type=int, default=None, help="Explicit virtual start nanoseconds")
     args = parser.parse_args()
 
     server = FlatFileWSServer(
@@ -260,6 +266,7 @@ def main():
         speed=args.speed,
         host=args.host,
         port=args.port,
+        virtual_start_ns=args.virtual_start_ns,
     )
     asyncio.run(server.run())
 
