@@ -280,3 +280,37 @@ func TestRelayLoopbackReplication(t *testing.T) {
 		t.Fatalf("Replica snapshot1 mismatch: %+v", replSnap1)
 	}
 }
+
+func TestInterArrivalJitterCalculation(t *testing.T) {
+	cli := &Client{}
+
+	// Frame 1 arrives at t = 1000ms, anchor = 1000ms
+	anchor1 := int64(1_000_000_000)
+	tNow1 := int64(1_000_000_000)
+	cli.lastAnchorNS = anchor1
+	cli.lastRecvNS = tNow1
+
+	// Frame 2 arrives 1073ms later (simulating +73ms Hyper-V clock drift), anchor2 = 2000ms (1000ms later)
+	anchor2 := int64(2_000_000_000)
+	tNow2 := tNow1 + 1_073_000_000
+	deltaArrival := tNow2 - cli.lastRecvNS
+	deltaAnchor := anchor2 - cli.lastAnchorNS
+	jitterUS := (deltaArrival - deltaAnchor) / 1000
+	if jitterUS != 73_000 {
+		t.Fatalf("Expected jitter 73000µs (73ms), got %dµs", jitterUS)
+	}
+	cli.lastAnchorNS = anchor2
+	cli.lastRecvNS = tNow2
+
+	// Frame 3 arrives another 1073ms later, anchor3 = 3000ms
+	anchor3 := int64(3_000_000_000)
+	tNow3 := tNow2 + 1_073_000_000
+	deltaArrival3 := tNow3 - cli.lastRecvNS
+	deltaAnchor3 := anchor3 - cli.lastAnchorNS
+	jitterUS3 := (deltaArrival3 - deltaAnchor3) / 1000
+	// CRITICAL: Jitter must REMAIN 73ms, NOT accumulate to 146ms or 2200ms
+	if jitterUS3 != 73_000 {
+		t.Fatalf("Jitter accumulated! Expected 73000µs, got %dµs", jitterUS3)
+	}
+}
+

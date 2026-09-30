@@ -35,6 +35,8 @@ type Client struct {
 	lastAnchor   atomic.Int64
 	reconnects   atomic.Int64
 	seqGaps      atomic.Int64
+	lastAnchorNS int64
+	lastRecvNS   int64
 }
 
 // NewClient creates a new relay client.
@@ -147,6 +149,8 @@ func (c *Client) runStream(ctx context.Context, conn net.Conn) error {
 	// 3. Streaming replication loop
 	var pendingSnapshots uint32 = 0
 	var lastPacketSeq uint64 = 0
+	c.lastAnchorNS = 0
+	c.lastRecvNS = 0
 
 	for {
 		if c.closed.Load() || ctx.Err() != nil {
@@ -197,23 +201,32 @@ func (c *Client) runStream(ctx context.Context, conn net.Conn) error {
 			pendingSnapshots = 0
 
 			tNow := time.Now().UnixNano()
-			latencyUS := int64(0)
-			if tNow > anchorNS {
-				latencyUS = (tNow - anchorNS) / 1000
+			var jitterUS int64 = 0
+			if c.lastAnchorNS > 0 && c.lastRecvNS > 0 {
+				deltaArrival := tNow - c.lastRecvNS
+				deltaAnchor := anchorNS - c.lastAnchorNS
+				if deltaAnchor > 0 {
+					diff := (deltaArrival - deltaAnchor) / 1000
+					if diff > 0 {
+						jitterUS = diff
+					}
+				}
 			}
+			c.lastAnchorNS = anchorNS
+			c.lastRecvNS = tNow
 
 			c.producer.CommitFrameFinalize(anchorNS)
-			c.producer.PublishTelemetry(latencyUS*1000, 0, uint64(c.seqGaps.Load()), uint64(c.anchorsCount.Load()))
+			c.producer.PublishTelemetry(jitterUS*1000, 0, uint64(c.seqGaps.Load()), uint64(c.anchorsCount.Load()))
 			c.anchorsCount.Add(1)
 			c.lastAnchor.Store(anchorNS)
 
-			if latencyUS > c.cfg.LatencyBudgetUS {
-				log.Printf("[SLO-VIOLATION] [RELAY-CLI] Replication latency exceeded %dms budget: %dµs @ anchor %d",
-					c.cfg.LatencyBudgetUS/1000, latencyUS, anchorNS)
+			if jitterUS > c.cfg.LatencyBudgetUS {
+				log.Printf("[SLO-VIOLATION] [RELAY-CLI] Replication arrival jitter exceeded %dms budget: %dµs @ anchor %d",
+					c.cfg.LatencyBudgetUS/1000, jitterUS, anchorNS)
 			}
 
-			log.Printf("[RELAY-CLI] Replicated anchor %d to /dev/shm/%s (%d snapshots, latency %dµs, gaps=%d, reconnects=%d)",
-				anchorNS, c.cfg.SHMName, appliedSnapshots, latencyUS, c.seqGaps.Load(), c.reconnects.Load())
+			log.Printf("[RELAY-CLI] Replicated anchor %d to /dev/shm/%s (%d snapshots, jitter %dµs, gaps=%d, reconnects=%d)",
+				anchorNS, c.cfg.SHMName, appliedSnapshots, jitterUS, c.seqGaps.Load(), c.reconnects.Load())
 
 		default:
 			log.Printf("[RELAY-CLI] Unrecognized message type 0x%02X, skipping", mType)
