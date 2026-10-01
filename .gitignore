@@ -34,3 +34,4 @@ __pycache__/
 # Output & Logs
 output/
 
+.centy/

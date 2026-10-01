@@ -1,0 +1,154 @@
+shm:
+  name: tickhub_test_arm_a
+  max_frames: 64
+  cadence_interval: 1000000000
+features:
+- log_ret_1s
+- log_ret_5s
+- log_ret_15s
+- vol_1s
+- spread_bps
+unique_symbols:
+- AAOI
+- ABBV
+- ADI
+- AGQ
+- ALAB
+- AMAT
+- ANET
+- APH
+- APP
+- ARM
+- ASTS
+- BE
+- BIDU
+- CDW
+- CEG
+- CIEN
+- COF
+- COHR
+- CRCL
+- CRDO
+- CRWD
+- CSCO
+- DASH
+- DELL
+- ETN
+- GE
+- GEV
+- GLW
+- GS
+- IBM
+- INTU
+- IR
+- ISRG
+- KLAC
+- LIN
+- LITE
+- LLY
+- LMT
+- LRCX
+- MELI
+- MRVL
+- NBIS
+- NOC
+- 'ON'
+- ORCL
+- PANW
+- QCOM
+- QQQ
+- RDDT
+- RKLB
+- RTX
+- SHOP
+- SNDK
+- SNOW
+- SPOT
+- SPY
+- STX
+- TER
+- TMO
+- TT
+- TXN
+- VLO
+- VRT
+- VST
+- WDC
+- XOM
+phases:
+- id: 0
+  name: phase_0ms
+  offset_ms: 0
+  symbols:
+  - SPY
+  - QQQ
+  - AAOI
+  - ABBV
+  - ADI
+  - AGQ
+  - ALAB
+  - AMAT
+  - ANET
+  - APH
+  - APP
+  - ARM
+  - ASTS
+  - BE
+  - BIDU
+  - CDW
+  - CEG
+  - CIEN
+  - COF
+  - COHR
+  - CRCL
+  - CRDO
+  - CRWD
+  - CSCO
+  - DASH
+  - DELL
+  - ETN
+  - GE
+  - GEV
+  - GLW
+  - GS
+  - IBM
+  - INTU
+  - IR
+- id: 1
+  name: phase_500ms
+  offset_ms: 500
+  symbols:
+  - SPY
+  - QQQ
+  - ISRG
+  - KLAC
+  - LIN
+  - LITE
+  - LLY
+  - LMT
+  - LRCX
+  - MELI
+  - MRVL
+  - NBIS
+  - NOC
+  - 'ON'
+  - ORCL
+  - PANW
+  - QCOM
+  - RDDT
+  - RKLB
+  - RTX
+  - SHOP
+  - SNDK
+  - SNOW
+  - SPOT
+  - STX
+  - TER
+  - TMO
+  - TT
+  - TXN
+  - VLO
+  - VRT
+  - VST
+  - WDC
+  - XOM
