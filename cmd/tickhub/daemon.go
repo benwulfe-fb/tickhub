@@ -313,11 +313,28 @@ func runDaemon(args []string) {
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 
-	cadenceNS := shmCfg.CadenceInterval.Nanoseconds()
-	if cadenceNS <= 0 {
-		cadenceNS = int64(time.Second)
+	flushNow := func(now time.Time) {
+		nowNS := now.UnixNano() + timeOffsetNS
+		prod.PublishTelemetry(0, watermarkBufferNS, 0, tickCount)
+
+		flushTarget := nowNS - watermarkBufferNS
+		if err := projector.Flush(flushTarget); err != nil {
+			log.Printf("[DAEMON] Flush error: %v", err)
+		}
+
+		if time.Since(lastReport) >= 5*time.Second {
+			elapsed := now.Sub(startTime).Seconds()
+			rate := float64(tickCount) / elapsed
+			enabled, _ := feedMgr.FeedStatus()
+			feedState := "ENABLED"
+			if !enabled {
+				feedState = "STANDBY"
+			}
+			log.Printf("[DAEMON] [%s] Ingested %d ticks (%.1f/sec), committed %d frames",
+				feedState, tickCount, rate, projector.CommittedFrames())
+			lastReport = now
+		}
 	}
-	var lastFlushedAnchor int64 = 0
 
 	for {
 		select {
@@ -330,29 +347,14 @@ func runDaemon(args []string) {
 			if err := projector.IngestTick(tick); err != nil {
 				log.Printf("[DAEMON] Ingest error: %v", err)
 			}
+			// Starvation-free check-after-ingest: if timer fired during tick burst, flush immediately
+			select {
+			case now := <-ticker.C:
+				flushNow(now)
+			default:
+			}
 		case now := <-ticker.C:
-			// Single-threaded event loop: zero data races with tick ingestion
-			nowNS := now.UnixNano() + timeOffsetNS
-			prod.PublishTelemetry(0, watermarkBufferNS, 0, tickCount)
-
-			wallAnchor := (nowNS / cadenceNS) * cadenceNS
-			if wallAnchor > lastFlushedAnchor {
-				_ = projector.Flush(wallAnchor)
-				lastFlushedAnchor = wallAnchor
-			}
-
-			if time.Since(lastReport) >= 5*time.Second {
-				elapsed := now.Sub(startTime).Seconds()
-				rate := float64(tickCount) / elapsed
-				enabled, _ := feedMgr.FeedStatus()
-				feedState := "ENABLED"
-				if !enabled {
-					feedState = "STANDBY"
-				}
-				log.Printf("[DAEMON] [%s] Ingested %d ticks (%.1f/sec), committed %d frames",
-					feedState, tickCount, rate, projector.CommittedFrames())
-				lastReport = now
-			}
+			flushNow(now)
 		}
 	}
 }
