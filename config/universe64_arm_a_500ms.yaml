@@ -13,7 +13,6 @@ unique_symbols:
 - ABBV
 - ADI
 - AGQ
-- ALAB
 - AMAT
 - ANET
 - APH
@@ -33,6 +32,7 @@ unique_symbols:
 - CSCO
 - DASH
 - DELL
+- ELVR
 - ETN
 - GE
 - GEV
@@ -86,7 +86,6 @@ phases:
   - ABBV
   - ADI
   - AGQ
-  - ALAB
   - AMAT
   - ANET
   - APH
@@ -106,6 +105,7 @@ phases:
   - CSCO
   - DASH
   - DELL
+  - ELVR
   - ETN
   - GE
   - GEV
