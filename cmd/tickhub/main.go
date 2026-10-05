@@ -39,6 +39,10 @@ func main() {
 
 	command := os.Args[1]
 	switch command {
+	case "record":
+		runRecord(os.Args[2:])
+	case "playback":
+		runPlayback(os.Args[2:])
 	case "replay":
 		runReplay(os.Args[2:])
 	case "worker":
@@ -54,7 +58,7 @@ func main() {
 	case "status":
 		runStatus(os.Args[2:])
 	case "version":
-		fmt.Println("TickHub v0.2.0 (Phase 3: Massive WS & TickHub Relay)")
+		fmt.Println("TickHub v0.3.0 (1Hz Telemetry Recorder & Playback Engine)")
 	case "help", "-h", "--help":
 		printUsage()
 		os.Exit(0)
@@ -71,6 +75,8 @@ func printUsage() {
 	fmt.Println("  daemon        Stream live market data from Massive.com WebSocket into SHM")
 	fmt.Println("  feed          Manage live market data feed status, enable, or disable")
 	fmt.Println("  status        Realtime ANSI terminal status inspection for /dev/shm")
+	fmt.Println("  record        Record 1Hz telemetry snapshots and frame projections into Parquet")
+	fmt.Println("  playback      Replay recorded 1Hz Parquet streams into SHM with flow control")
 	fmt.Println("  relay-server  Stream SHM frames and snapshots over TCP binary protocol")
 	fmt.Println("  relay-client  Receive binary TCP stream and replicate into local SHM")
 	fmt.Println("  replay        Stream historical Parquet ticks into SHM with lossless backpressure")
