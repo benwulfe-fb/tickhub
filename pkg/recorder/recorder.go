@@ -3,9 +3,11 @@ package recorder
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -41,6 +43,14 @@ type Recorder struct {
 	writer      *parquet.GenericWriter[MetricRow]
 	currentPath string
 	closed      atomic.Bool
+	tzLoc       *time.Location
+	rthStartH   int
+	rthStartM   int
+	rthStartS   int
+	rthEndH     int
+	rthEndM     int
+	rthEndS     int
+	lastRTHLog  time.Time
 }
 
 // NewRecorder initializes a new Recorder instance attached to the specified SHM segment.
@@ -59,6 +69,29 @@ func NewRecorder(cfg Config) (*Recorder, error) {
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 50 * time.Millisecond
+	}
+	if cfg.Timezone == "" {
+		cfg.Timezone = "America/New_York"
+	}
+	if cfg.RTHStart == "" {
+		cfg.RTHStart = "09:30:00"
+	}
+	if cfg.RTHEnd == "" {
+		cfg.RTHEnd = "16:00:00"
+	}
+
+	tzLoc, err := time.LoadLocation(cfg.Timezone)
+	if err != nil {
+		return nil, fmt.Errorf("load timezone %q: %w", cfg.Timezone, err)
+	}
+
+	startH, startM, startS, err := parseTimeHMS(cfg.RTHStart)
+	if err != nil {
+		return nil, fmt.Errorf("invalid RTHStart %q: %w", cfg.RTHStart, err)
+	}
+	endH, endM, endS, err := parseTimeHMS(cfg.RTHEnd)
+	if err != nil {
+		return nil, fmt.Errorf("invalid RTHEnd %q: %w", cfg.RTHEnd, err)
 	}
 
 	cleanName := strings.TrimPrefix(cfg.SHMName, "/dev/shm/")
@@ -167,7 +200,54 @@ func NewRecorder(cfg Config) (*Recorder, error) {
 		trackedMap: trackedMap,
 		buffer:     make([]MetricRow, 0, cfg.BatchSize*2),
 		lastFlush:  time.Now(),
+		tzLoc:      tzLoc,
+		rthStartH:  startH,
+		rthStartM:  startM,
+		rthStartS:  startS,
+		rthEndH:    endH,
+		rthEndM:    endM,
+		rthEndS:    endS,
 	}, nil
+}
+
+// parseTimeHMS parses "HH:MM" or "HH:MM:SS" into hours, minutes, seconds.
+func parseTimeHMS(s string) (int, int, int, error) {
+	parts := strings.Split(strings.TrimSpace(s), ":")
+	if len(parts) != 2 && len(parts) != 3 {
+		return 0, 0, 0, fmt.Errorf("expected HH:MM or HH:MM:SS, got %q", s)
+	}
+	h, err := strconv.Atoi(parts[0])
+	if err != nil || h < 0 || h > 23 {
+		return 0, 0, 0, fmt.Errorf("invalid hour in %q", s)
+	}
+	m, err := strconv.Atoi(parts[1])
+	if err != nil || m < 0 || m > 59 {
+		return 0, 0, 0, fmt.Errorf("invalid minute in %q", s)
+	}
+	sec := 0
+	if len(parts) == 3 {
+		sec, err = strconv.Atoi(parts[2])
+		if err != nil || sec < 0 || sec > 59 {
+			return 0, 0, 0, fmt.Errorf("invalid second in %q", s)
+		}
+	}
+	return h, m, sec, nil
+}
+
+// IsRTH checks whether the given anchor timestamp (nanoseconds) falls within Regular Trading Hours (Mon-Fri 09:30:00 - 16:00:00 in configured timezone).
+func (r *Recorder) IsRTH(anchorNS int64) bool {
+	t := time.Unix(0, anchorNS).In(r.tzLoc)
+
+	// Monday through Friday only
+	weekday := t.Weekday()
+	if weekday == time.Saturday || weekday == time.Sunday {
+		return false
+	}
+
+	start := time.Date(t.Year(), t.Month(), t.Day(), r.rthStartH, r.rthStartM, r.rthStartS, 0, r.tzLoc)
+	end := time.Date(t.Year(), t.Month(), t.Day(), r.rthEndH, r.rthEndM, r.rthEndS, 0, r.tzLoc)
+
+	return !t.Before(start) && !t.After(end)
 }
 
 // Start runs the polling loop, capturing 1Hz snapshots on anchor advances.
@@ -208,6 +288,31 @@ func (r *Recorder) PollOnce() error {
 		}
 		return nil
 	}
+
+	// RTH gating: if enabled and anchor falls outside RTH, flush any remaining buffer and skip row recording
+	if r.cfg.RTHOnly && !r.IsRTH(anchorNS) {
+		if len(r.buffer) > 0 {
+			if err := r.flushLocked(); err != nil {
+				return fmt.Errorf("flush at RTH close: %w", err)
+			}
+		}
+		r.lastAnchor = anchorNS
+
+		now := time.Now().UnixNano()
+		r.stats.AnchorLagNS = now - anchorNS
+		r.stats.LastAnchorNS = anchorNS
+
+		if r.lastRTHLog.IsZero() || time.Since(r.lastRTHLog) >= 15*time.Minute {
+			t := time.Unix(0, anchorNS).In(r.tzLoc)
+			log.Printf("[RECORD] Outside RTH (%s %s); skipping recording (anchor: %d)",
+				t.Weekday(), t.Format("15:04:05 MST"), anchorNS)
+			r.lastRTHLog = time.Now()
+		}
+		return nil
+	}
+
+	// Reset RTH log throttle so the next transition outside RTH immediately logs once
+	r.lastRTHLog = time.Time{}
 
 	cadenceNS := int64(hdr.CadenceInterval)
 	if cadenceNS <= 0 {

@@ -1,8 +1,5 @@
 package recorder
 
-import (
-	"time"
-)
 
 // MetricRow represents a canonical 1Hz top-of-book snapshot and feature projection record.
 type MetricRow struct {
@@ -34,16 +31,6 @@ type MetricRow struct {
 	Features    []float64 `parquet:"features,list"`
 }
 
-// Config configures the 1Hz telemetry recorder.
-type Config struct {
-	SHMName       string        // Shared memory segment to attach to (default: "tickhub_live")
-	OutDir        string        // Output directory for daily partitioned Parquet files (default: "./recordings")
-	OutFile       string        // Optional direct file path override
-	Symbols       []string      // Symbol whitelist; if empty, all symbols in SHM directory are recorded
-	FlushInterval time.Duration // Interval to flush buffered rows to disk (default: 10s)
-	BatchSize     int           // Max buffered rows before immediate flush (default: 5000)
-	PollInterval  time.Duration // Polling interval for anchor checks (default: 50ms)
-}
 
 // Stats holds running operational telemetry for the recorder.
 type Stats struct {

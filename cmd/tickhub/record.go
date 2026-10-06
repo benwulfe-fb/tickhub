@@ -22,6 +22,10 @@ func runRecord(args []string) {
 	flushInterval := fs.Duration("flush-interval", 10*time.Second, "Buffered row flush interval")
 	batchSize := fs.Int("batch-size", 5000, "Maximum buffered rows before immediate flush")
 	pollInterval := fs.Duration("poll-interval", 50*time.Millisecond, "Polling interval for anchor advance checks")
+	rthOnly := fs.Bool("rth-only", true, "Record only during Regular Trading Hours (09:30-16:00 ET, Mon-Fri)")
+	tz := fs.String("tz", "America/New_York", "Timezone for RTH filtering")
+	rthStart := fs.String("rth-start", "09:30:00", "RTH start time (HH:MM:SS)")
+	rthEnd := fs.String("rth-end", "16:00:00", "RTH end time (HH:MM:SS)")
 	fs.Parse(args)
 
 	var symbols []string
@@ -56,18 +60,39 @@ func runRecord(args []string) {
 		FlushInterval: *flushInterval,
 		BatchSize:     *batchSize,
 		PollInterval:  *pollInterval,
-	}
-
-	rec, err := recorder.NewRecorder(cfg)
-	if err != nil {
-		log.Fatalf("[RECORD] Failed to initialize recorder: %v", err)
+		RTHOnly:       *rthOnly,
+		Timezone:      *tz,
+		RTHStart:      *rthStart,
+		RTHEnd:        *rthEnd,
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	log.Printf("[RECORD] Starting 1Hz telemetry recorder on /dev/shm/%s (OutDir: %s, Flush: %v, Batch: %d, PID: %d)",
-		*shmName, *outDir, *flushInterval, *batchSize, os.Getpid())
+	var rec *recorder.Recorder
+	var lastLog time.Time
+	for {
+		var err error
+		rec, err = recorder.NewRecorder(cfg)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Since(lastLog) >= 10*time.Second {
+			log.Printf("[RECORD] Waiting for /dev/shm/%s to become active: %v", *shmName, err)
+			lastLog = time.Now()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+
+	log.Printf("[RECORD] Starting 1Hz telemetry recorder on /dev/shm/%s (OutDir: %s, Flush: %v, Batch: %d, RTHOnly: %v, TZ: %s, PID: %d)",
+		*shmName, *outDir, *flushInterval, *batchSize, *rthOnly, *tz, os.Getpid())
 
 	// Periodic telemetry reporting goroutine
 	go func() {
