@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -154,6 +155,7 @@ type MassiveWSClient struct {
 	conn      *websocket.Conn
 	mu        sync.Mutex
 	wg        sync.WaitGroup
+	spooler   atomic.Pointer[RawSpooler]
 }
 
 // NewMassiveWSClient constructs a new client instance.
@@ -171,6 +173,16 @@ func NewMassiveWSClient(url, apiKey string, symbols []string, bufferSize int) *M
 		tickChan: make(chan Tick, bufferSize),
 		stopChan: make(chan struct{}),
 	}
+}
+
+// SetRawSpooler attaches an asynchronous raw feed spooler.
+func (c *MassiveWSClient) SetRawSpooler(s *RawSpooler) {
+	c.spooler.Store(s)
+}
+
+// RawSpooler returns the attached raw feed spooler, if any.
+func (c *MassiveWSClient) RawSpooler() *RawSpooler {
+	return c.spooler.Load()
 }
 
 // Ticks returns the receive-only channel of parsed Ticks.
@@ -344,6 +356,11 @@ func (c *MassiveWSClient) readPump(ctx context.Context) {
 				return
 			}
 			continue
+		}
+
+		recvNS := time.Now().UnixNano()
+		if sp := c.spooler.Load(); sp != nil {
+			sp.Record(recvNS, msg)
 		}
 
 		ticks, err := ParseMassiveEvents(msg)

@@ -24,6 +24,11 @@ type FeedController interface {
 	DisableFeed(ctx context.Context) error
 }
 
+// RawSpoolerStats defines dynamic telemetry export for the raw feed spooler.
+type RawSpoolerStats interface {
+	SpoolStats() (bytes uint64, packets uint64, dropped uint64)
+}
+
 // Server provides HTTP observability endpoints (/metrics, /healthz, /readyz, /control/feed).
 type Server struct {
 	addr              string
@@ -35,6 +40,7 @@ type Server struct {
 	missedAnchors     uint64
 	committedFramesFn func() int
 	feedCtrl          FeedController
+	rawSpoolerStats   RawSpoolerStats
 	feedMu            sync.RWMutex
 }
 
@@ -54,6 +60,13 @@ func (s *Server) SetFeedController(fc FeedController) {
 	s.feedMu.Lock()
 	defer s.feedMu.Unlock()
 	s.feedCtrl = fc
+}
+
+// SetRawSpoolerStats attaches a raw spooler metrics provider.
+func (s *Server) SetRawSpoolerStats(st RawSpoolerStats) {
+	s.feedMu.Lock()
+	defer s.feedMu.Unlock()
+	s.rawSpoolerStats = st
 }
 
 // NewServer initializes an HTTP metrics and health monitoring server.
@@ -235,6 +248,30 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprintf(w, "# HELP tickhub_recovery_missed_anchors_total Total 1Hz anchors missed during downtime\n")
 	_, _ = fmt.Fprintf(w, "# TYPE tickhub_recovery_missed_anchors_total counter\n")
 	_, _ = fmt.Fprintf(w, "tickhub_recovery_missed_anchors_total %d\n\n", s.missedAnchors)
+
+	var (
+		rawSpoolBytes   uint64
+		rawSpoolPackets uint64
+		rawSpoolDropped uint64
+	)
+	s.feedMu.RLock()
+	st := s.rawSpoolerStats
+	s.feedMu.RUnlock()
+	if st != nil {
+		rawSpoolBytes, rawSpoolPackets, rawSpoolDropped = st.SpoolStats()
+	}
+
+	_, _ = fmt.Fprintf(w, "# HELP tickhub_raw_spool_bytes_total Total raw bytes written to compressed disk files\n")
+	_, _ = fmt.Fprintf(w, "# TYPE tickhub_raw_spool_bytes_total counter\n")
+	_, _ = fmt.Fprintf(w, "tickhub_raw_spool_bytes_total %d\n\n", rawSpoolBytes)
+
+	_, _ = fmt.Fprintf(w, "# HELP tickhub_raw_spool_packets_total Total raw WebSocket packets spooled\n")
+	_, _ = fmt.Fprintf(w, "# TYPE tickhub_raw_spool_packets_total counter\n")
+	_, _ = fmt.Fprintf(w, "tickhub_raw_spool_packets_total %d\n\n", rawSpoolPackets)
+
+	_, _ = fmt.Fprintf(w, "# HELP tickhub_raw_spool_dropped_total Total raw packets dropped due to full spool buffer\n")
+	_, _ = fmt.Fprintf(w, "# TYPE tickhub_raw_spool_dropped_total counter\n")
+	_, _ = fmt.Fprintf(w, "tickhub_raw_spool_dropped_total %d\n\n", rawSpoolDropped)
 
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)

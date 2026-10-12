@@ -30,6 +30,7 @@ type FeedManager struct {
 	apiKey       string
 	symbols      []string
 	client       *feed.MassiveWSClient
+	spooler      *feed.RawSpooler
 	rootCtx      context.Context
 	clientCtx    context.Context
 	clientCancel context.CancelFunc
@@ -48,6 +49,15 @@ func NewFeedManager(rootCtx context.Context, endpoint, apiKey string, symbols []
 		apiKey:   apiKey,
 		symbols:  symbols,
 		tickCh:   make(chan feed.Tick, 65536),
+	}
+}
+
+func (fm *FeedManager) SetRawSpooler(s *feed.RawSpooler) {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	fm.spooler = s
+	if fm.client != nil {
+		fm.client.SetRawSpooler(s)
 	}
 }
 
@@ -72,6 +82,9 @@ func (fm *FeedManager) EnableFeed(ctx context.Context) error {
 	}
 
 	client := feed.NewMassiveWSClient(fm.endpoint, fm.apiKey, fm.symbols, 65536)
+	if fm.spooler != nil {
+		client.SetRawSpooler(fm.spooler)
+	}
 	clientCtx, clientCancel := context.WithCancel(fm.rootCtx)
 	if err := client.Start(clientCtx); err != nil {
 		clientCancel()
@@ -146,6 +159,7 @@ func runDaemon(args []string) {
 	feedEnabled := fs.Bool("feed-enabled", false, "Enable live Massive.com WebSocket feed on boot (default false for safe standby)")
 	timeOffsetStr := fs.String("time-offset", "", "Time offset duration (e.g. -50h30m, -181800s, or integer nanoseconds) to align anchors with replay timeline")
 	watermarkBufferStr := fs.String("watermark-buffer", "50ms", "Watermark latency buffer before committing frames on tick streams")
+	rawSpoolDir := fs.String("raw-spool-dir", "", "Optional output directory to spool raw incoming Massive.com WebSocket frames to daily .jsonl.zst files (e.g. /opt/ccm/recordings/raw)")
 	fs.Parse(args)
 
 	var watermarkBufferNS int64 = 50_000_000
@@ -276,7 +290,24 @@ func runDaemon(args []string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	var rawSpooler *feed.RawSpooler
+	if *rawSpoolDir != "" {
+		sp, err := feed.NewRawSpooler(feed.RawSpoolerConfig{
+			Dir: *rawSpoolDir,
+		})
+		if err != nil {
+			log.Fatalf("[DAEMON] Failed to initialize raw spooler for dir %s: %v", *rawSpoolDir, err)
+		}
+		rawSpooler = sp
+		rawSpooler.Start(ctx)
+		defer rawSpooler.Close()
+		log.Printf("[DAEMON] Raw market data spooler active. Spooling verbatim frames to %s", *rawSpoolDir)
+	}
+
 	feedMgr := NewFeedManager(ctx, *wsEndpoint, key, rawCfg.UniqueSymbols)
+	if rawSpooler != nil {
+		feedMgr.SetRawSpooler(rawSpooler)
+	}
 	defer feedMgr.Close()
 
 	// Start metrics server
@@ -284,6 +315,9 @@ func runDaemon(args []string) {
 	metricsSrv.SetRecoveryStats(prod.DowntimeNS(), prod.MissedAnchors())
 	metricsSrv.SetCommittedFramesFunc(projector.CommittedFrames)
 	metricsSrv.SetFeedController(feedMgr)
+	if rawSpooler != nil {
+		metricsSrv.SetRawSpoolerStats(rawSpooler)
+	}
 
 	if err := metricsSrv.Start(); err != nil {
 		log.Printf("[METRICS] Warning: failed to start HTTP server on %s: %v", *metricsAddr, err)
