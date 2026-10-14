@@ -177,8 +177,10 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 
 	lastSentSeq := make([]uint64, hdr.TotalSymbols)
+	lastSentMicroSeq := make([]uint64, hdr.TotalSymbols)
 	bw := bufio.NewWriterSize(conn, 64*1024)
 	var scratchSnap shm.SymbolSnapshot
+	var scratchMicro shm.SymbolMicroSnapshot
 	isFirstClientAnchor := true
 
 	pollTimer := time.NewTimer(s.cfg.PollInterval)
@@ -211,6 +213,15 @@ func (s *Server) handleConn(conn net.Conn) {
 					seq++
 					lastSentSeq[i] = scratchSnap.SeqLockSeq
 					numSnapshots++
+				}
+				readMicroSnapshotSeqLock(s.segment, i, &scratchMicro)
+				if isFirstClientAnchor || (scratchMicro.SeqLockSeq > 0 && scratchMicro.SeqLockSeq != lastSentMicroSeq[i]) {
+					microPayload := EncodeMicroSnapshot(uint16(i), &scratchMicro)
+					if err := WritePacket(bw, MsgTypeMicroSnapshot, seq, microPayload); err != nil {
+						return
+					}
+					seq++
+					lastSentMicroSeq[i] = scratchMicro.SeqLockSeq
 				}
 			}
 			isFirstClientAnchor = false
@@ -256,6 +267,13 @@ func (s *Server) handleConn(conn net.Conn) {
 					_ = WritePacket(bw, MsgTypeSnapshot, seq, snapPayload)
 					seq++
 					lastSentSeq[i] = scratchSnap.SeqLockSeq
+				}
+				readMicroSnapshotSeqLock(s.segment, i, &scratchMicro)
+				if scratchMicro.SeqLockSeq > 0 && scratchMicro.SeqLockSeq != lastSentMicroSeq[i] {
+					microPayload := EncodeMicroSnapshot(uint16(i), &scratchMicro)
+					_ = WritePacket(bw, MsgTypeMicroSnapshot, seq, microPayload)
+					seq++
+					lastSentMicroSeq[i] = scratchMicro.SeqLockSeq
 				}
 			}
 			_ = bw.Flush()
@@ -320,6 +338,32 @@ func readSnapshotSeqLock(seg *shm.Segment, symbolIdx int, dst *shm.SymbolSnapsho
 		runtime.Gosched()
 	}
 	// Fallback under high contention / terminated producer: best-effort copy
+	copy(dstBytes, srcBytes)
+}
+
+func readMicroSnapshotSeqLock(seg *shm.Segment, symbolIdx int, dst *shm.SymbolMicroSnapshot) {
+	raw := seg.Bytes()
+	offset := shm.MicroSnapshotOffset + uintptr(symbolIdx)*128
+	src := (*shm.SymbolMicroSnapshot)(unsafe.Pointer(&raw[offset]))
+	microSize := int(unsafe.Sizeof(*dst))
+
+	srcBytes := unsafe.Slice((*byte)(unsafe.Pointer(src)), microSize)
+	dstBytes := unsafe.Slice((*byte)(unsafe.Pointer(dst)), microSize)
+
+	const maxSpins = 1000
+	for spin := 0; spin < maxSpins; spin++ {
+		seq1 := atomic.LoadUint64(&src.SeqLockSeq)
+		if seq1%2 != 0 {
+			runtime.Gosched()
+			continue
+		}
+		copy(dstBytes, srcBytes)
+		seq2 := atomic.LoadUint64(&src.SeqLockSeq)
+		if seq1 == seq2 {
+			return
+		}
+		runtime.Gosched()
+	}
 	copy(dstBytes, srcBytes)
 }
 

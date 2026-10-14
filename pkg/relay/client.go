@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/benwulfe-fb/tickhub/pkg/project"
 	"github.com/benwulfe-fb/tickhub/pkg/shm"
 )
 
@@ -151,6 +152,10 @@ func (c *Client) runStream(ctx context.Context, conn net.Conn) error {
 	var lastPacketSeq uint64 = 0
 	c.lastAnchorNS = 0
 	c.lastRecvNS = 0
+	hasRemoteMicro := false
+	localTrackers := make([]project.MicroTracker, len(symbols))
+	lastConds := make([]uint32, len(symbols))
+	var scratchMicro shm.SymbolMicroSnapshot
 
 	for {
 		if c.closed.Load() || ctx.Err() != nil {
@@ -176,8 +181,29 @@ func (c *Client) runStream(ctx context.Context, conn net.Conn) error {
 			if err != nil {
 				return fmt.Errorf("decode snapshot: %w", err)
 			}
-			c.producer.WriteSnapshot(int(symbolIdx), snap)
+			sIdx := int(symbolIdx)
+			c.producer.WriteSnapshot(sIdx, snap)
+			if !hasRemoteMicro && sIdx >= 0 && sIdx < len(localTrackers) {
+				mt := &localTrackers[sIdx]
+				if snap.BidPx > 0 || snap.AskPx > 0 {
+					mt.OnQuote(snap.SIPTimestampNS, snap.BidPx, snap.AskPx)
+				}
+				if snap.Conditions != lastConds[sIdx] && snap.LastTradePx > 0 && snap.LastTradeSz > 0 {
+					mt.OnTrade(snap.SIPTimestampNS, snap.LastTradePx, snap.LastTradeSz)
+					lastConds[sIdx] = snap.Conditions
+				}
+				mt.ComputeSnapshot(snap.SIPTimestampNS, &scratchMicro)
+				c.producer.WriteMicroSnapshot(sIdx, &scratchMicro)
+			}
 			pendingSnapshots++
+
+		case MsgTypeMicroSnapshot:
+			symbolIdx, micro, err := DecodeMicroSnapshot(msgPayload)
+			if err != nil {
+				return fmt.Errorf("decode micro snapshot: %w", err)
+			}
+			hasRemoteMicro = true
+			c.producer.WriteMicroSnapshot(int(symbolIdx), micro)
 
 		case MsgTypeFrameSlot:
 			phaseIdx, slotIdx, _, rawSlotBytes, err := DecodeFrameSlot(msgPayload)

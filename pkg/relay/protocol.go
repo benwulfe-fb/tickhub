@@ -13,10 +13,11 @@ const (
 	RelayMagic   uint32 = 0x5448524C // "THRL"
 	RelayVersion uint32 = 1
 
-	MsgTypeHandshake uint8 = 0x01
-	MsgTypeSnapshot  uint8 = 0x02
-	MsgTypeFrameSlot uint8 = 0x03
-	MsgTypeAnchor    uint8 = 0x04
+	MsgTypeHandshake     uint8 = 0x01
+	MsgTypeSnapshot      uint8 = 0x02
+	MsgTypeFrameSlot     uint8 = 0x03
+	MsgTypeAnchor        uint8 = 0x04
+	MsgTypeMicroSnapshot uint8 = 0x05
 )
 
 var (
@@ -159,6 +160,29 @@ func DecodeSnapshot(data []byte) (uint16, *shm.SymbolSnapshot, error) {
 	snapDst := unsafe.Slice((*byte)(unsafe.Pointer(&snap)), snapSize)
 	copy(snapDst, data[2:2+snapSize])
 	return symbolIdx, &snap, nil
+}
+
+// EncodeMicroSnapshot encodes symbolIdx and SymbolMicroSnapshot.
+func EncodeMicroSnapshot(symbolIdx uint16, micro *shm.SymbolMicroSnapshot) []byte {
+	microSize := int(unsafe.Sizeof(*micro))
+	buf := make([]byte, 2+microSize)
+	binary.BigEndian.PutUint16(buf[0:2], symbolIdx)
+	microSlice := unsafe.Slice((*byte)(unsafe.Pointer(micro)), microSize)
+	copy(buf[2:2+microSize], microSlice)
+	return buf
+}
+
+// DecodeMicroSnapshot decodes symbolIdx and SymbolMicroSnapshot safely copying into an aligned struct.
+func DecodeMicroSnapshot(data []byte) (uint16, *shm.SymbolMicroSnapshot, error) {
+	microSize := int(unsafe.Sizeof(shm.SymbolMicroSnapshot{}))
+	if len(data) < 2+microSize {
+		return 0, nil, io.ErrUnexpectedEOF
+	}
+	symbolIdx := binary.BigEndian.Uint16(data[0:2])
+	var micro shm.SymbolMicroSnapshot
+	microDst := unsafe.Slice((*byte)(unsafe.Pointer(&micro)), microSize)
+	copy(microDst, data[2:2+microSize])
+	return symbolIdx, &micro, nil
 }
 
 // EncodeFrameSlot encodes phaseIdx, slotIdx, anchorNS, and raw slot bytes.
