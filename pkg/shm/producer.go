@@ -754,10 +754,13 @@ func (p *Producer) ReadHistoryBars(phaseIdx int, symbolPhaseIdx int, maxBars int
 	nFeat := uintptr(p.header.Phases[phaseIdx].NumFeatures)
 	raw := p.segment.Bytes()
 
+	offsetNS := int64(p.header.Phases[phaseIdx].OffsetMS) * 1_000_000
+	latestPhaseAnchor := ((lastAnchor-offsetNS)/cadenceNS)*cadenceNS + offsetNS
+
 	bars := make([]FrameBar, 0, maxBars)
 
 	for step := maxBars - 1; step >= 0; step-- {
-		anchor := lastAnchor - int64(step)*cadenceNS
+		anchor := latestPhaseAnchor - int64(step)*cadenceNS
 		slot := uint32((anchor / cadenceNS) & int64(p.header.MaxFrames-1))
 		frameOffset := p.phaseOffsets[phaseIdx] + uintptr(slot)*p.phaseStrides[phaseIdx]
 

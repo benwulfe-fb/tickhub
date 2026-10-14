@@ -158,11 +158,11 @@ func runDaemon(args []string) {
 	noUnlink := fs.Bool("no-unlink", false, "Do not unlink SHM segment on exit")
 	feedEnabled := fs.Bool("feed-enabled", false, "Enable live Massive.com WebSocket feed on boot (default false for safe standby)")
 	timeOffsetStr := fs.String("time-offset", "", "Time offset duration (e.g. -50h30m, -181800s, or integer nanoseconds) to align anchors with replay timeline")
-	watermarkBufferStr := fs.String("watermark-buffer", "50ms", "Watermark latency buffer before committing frames on tick streams")
+	watermarkBufferStr := fs.String("watermark-buffer", "100ms", "Watermark latency buffer before committing frames on tick streams")
 	rawSpoolDir := fs.String("raw-spool-dir", "", "Optional output directory to spool raw incoming Massive.com WebSocket frames to daily .jsonl.zst files (e.g. /opt/ccm/recordings/raw)")
 	fs.Parse(args)
 
-	var watermarkBufferNS int64 = 50_000_000
+	var watermarkBufferNS int64 = 100_000_000
 	if *watermarkBufferStr != "" {
 		if d, err := time.ParseDuration(*watermarkBufferStr); err == nil {
 			watermarkBufferNS = d.Nanoseconds()
@@ -253,6 +253,7 @@ func runDaemon(args []string) {
 	defer prod.Close()
 
 	projector := project.NewProjector(prod, phaseConfigs, rawCfg.UniqueSymbols, shmCfg.CadenceInterval)
+	projector.SetWatermarkBuffer(time.Duration(watermarkBufferNS))
 	projector.SetStartAnchor(time.Now().UnixNano() + timeOffsetNS)
 
 	switch recMode {
@@ -348,12 +349,23 @@ func runDaemon(args []string) {
 	defer ticker.Stop()
 
 	flushNow := func(now time.Time) {
-		nowNS := now.UnixNano() + timeOffsetNS
-		prod.PublishTelemetry(0, watermarkBufferNS, 0, tickCount)
+		prod.PublishTelemetry(0, watermarkBufferNS, projector.LateDroppedTicks(), tickCount)
 
-		flushTarget := nowNS - watermarkBufferNS
-		if err := projector.Flush(flushTarget); err != nil {
-			log.Printf("[DAEMON] Flush error: %v", err)
+		var flushTarget int64
+		if projector.IsCCM44() {
+			vNow := projector.VirtualStreamNow(now)
+			if vNow > watermarkBufferNS {
+				flushTarget = vNow - watermarkBufferNS
+			}
+		} else {
+			nowNS := now.UnixNano() + timeOffsetNS
+			flushTarget = nowNS - watermarkBufferNS
+		}
+
+		if flushTarget > 0 {
+			if err := projector.Flush(flushTarget); err != nil {
+				log.Printf("[DAEMON] Flush error: %v", err)
+			}
 		}
 
 		if time.Since(lastReport) >= 5*time.Second {

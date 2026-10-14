@@ -2,6 +2,7 @@ package project
 
 import (
 	"math"
+	"sort"
 	"time"
 
 	"github.com/benwulfe-fb/tickhub/pkg/shm"
@@ -263,143 +264,288 @@ func (h *SymbolHistory) SeedPrevailingPrice(lastPx, lastBid, lastAsk float64) {
 }
 
 const (
-	microBucketNS   int64 = 250_000_000 // 250ms per bucket
-	numMicroBuckets int64 = 128         // 32 seconds of 250ms buckets
+	maxMicroQuotes = 4096
+	maxMicroTrades = 1024
 )
 
-type microBucket struct {
-	bucketIdx      int64
-	bid            float64
-	ask            float64
-	mid            float64
-	tradeVol       float64
-	tradeNotional  float64
-	signedTradeVol float64
-	tradeCount     uint32
+type microQuote struct {
+	tsNS    int64
+	partNS  int64
+	bid     float64
+	ask     float64
+	mid     float64
+	bidExch int16
 }
 
-// MicroTracker maintains a fixed-size 250ms ring buffer (128 buckets = 32s)
-// per symbol to populate shm.SymbolMicroSnapshot with zero heap allocations.
+type microTrade struct {
+	tsNS  int64
+	price float64
+	size  float64
+	isBuy bool
+}
+
+// MicroTracker maintains exact non-discretized point-in-time quote and trade history
+// per symbol to populate shm.SymbolMicroSnapshot with zero discretization error.
 type MicroTracker struct {
-	buckets       [numMicroBuckets]microBucket
-	lastBucketIdx int64
-	lastBid       float64
-	lastAsk       float64
-	lastMid       float64
-	initialized   bool
+	quotes       [maxMicroQuotes]microQuote
+	qHead        int
+	qCount       int
+	trades       [maxMicroTrades]microTrade
+	tHead        int
+	tCount       int
+	venueLatest  [256]ccmQuoteEntry
+	seedBid      float64
+	seedAsk      float64
+	seedMid      float64
+	maxTS        int64
+	prevTradePx  float64
+	hasPrevTrade bool
+	lastIsBuy    bool
+	initialized  bool
 }
 
-func (m *MicroTracker) advanceTo(tsNS int64) {
-	if tsNS <= 0 {
-		return
-	}
-	targetIdx := tsNS / microBucketNS
-	if !m.initialized {
-		for i := int64(0); i < numMicroBuckets; i++ {
-			bIdx := targetIdx - (numMicroBuckets - 1 - i)
-			slot := bIdx & (numMicroBuckets - 1)
-			m.buckets[slot] = microBucket{
-				bucketIdx: bIdx,
-				bid:       m.lastBid,
-				ask:       m.lastAsk,
-				mid:       m.lastMid,
-			}
-		}
-		m.lastBucketIdx = targetIdx
-		m.initialized = true
-		return
-	}
-	if targetIdx <= m.lastBucketIdx {
-		return
-	}
-	gap := targetIdx - m.lastBucketIdx
-	if gap >= numMicroBuckets {
-		for i := int64(0); i < numMicroBuckets; i++ {
-			bIdx := targetIdx - (numMicroBuckets - 1 - i)
-			slot := bIdx & (numMicroBuckets - 1)
-			m.buckets[slot] = microBucket{
-				bucketIdx: bIdx,
-				bid:       m.lastBid,
-				ask:       m.lastAsk,
-				mid:       m.lastMid,
-			}
-		}
-	} else {
-		for bIdx := m.lastBucketIdx + 1; bIdx <= targetIdx; bIdx++ {
-			slot := bIdx & (numMicroBuckets - 1)
-			m.buckets[slot] = microBucket{
-				bucketIdx: bIdx,
-				bid:       m.lastBid,
-				ask:       m.lastAsk,
-				mid:       m.lastMid,
-			}
-		}
-	}
-	m.lastBucketIdx = targetIdx
-}
-
-// SeedQuote initializes baseline bid/ask/mid across the ring buffer.
+// SeedQuote initializes baseline bid/ask/mid across the tracker.
 func (m *MicroTracker) SeedQuote(bid, ask float64) {
 	if bid > 0 {
-		m.lastBid = bid
+		m.seedBid = bid
 	}
 	if ask > 0 {
-		m.lastAsk = ask
+		m.seedAsk = ask
 	}
-	if m.lastBid > 0 && m.lastAsk > 0 {
-		m.lastMid = 0.5 * (m.lastBid + m.lastAsk)
+	if m.seedBid > 0 && m.seedAsk > 0 {
+		m.seedMid = 0.5 * (m.seedBid + m.seedAsk)
 	}
-	for i := range m.buckets {
-		m.buckets[i].bid = m.lastBid
-		m.buckets[i].ask = m.lastAsk
-		m.buckets[i].mid = m.lastMid
+	m.qHead = 0
+	m.qCount = 0
+	m.tHead = 0
+	m.tCount = 0
+	for i := range m.venueLatest {
+		m.venueLatest[i] = ccmQuoteEntry{}
 	}
+	m.hasPrevTrade = false
+	m.prevTradePx = 0.0
+	m.lastIsBuy = true
+	m.initialized = true
 }
 
-// OnQuote updates the current 250ms bucket with the latest quote and recomputes mid.
+// OnQuote records an incoming quote using tsNS for both SIP and participant timestamps.
 func (m *MicroTracker) OnQuote(tsNS int64, bid, ask float64) {
-	m.advanceTo(tsNS)
-	if bid > 0 {
-		m.lastBid = bid
-	}
-	if ask > 0 {
-		m.lastAsk = ask
-	}
-	if m.lastBid > 0 && m.lastAsk > 0 {
-		m.lastMid = 0.5 * (m.lastBid + m.lastAsk)
-	}
-	if m.initialized {
-		slot := m.lastBucketIdx & (numMicroBuckets - 1)
-		m.buckets[slot].bid = m.lastBid
-		m.buckets[slot].ask = m.lastAsk
-		m.buckets[slot].mid = m.lastMid
-	}
+	m.OnQuoteWithExch(tsNS, tsNS, bid, ask, 0)
 }
 
-// OnTrade accumulates trade count, volume, notional, and signed volume in the current 250ms bucket.
-func (m *MicroTracker) OnTrade(tsNS int64, price, size float64) {
-	m.advanceTo(tsNS)
-	if !m.initialized || price <= 0 || size <= 0 {
+// OnQuoteWithExch records an incoming quote with full exchange and participant metadata.
+func (m *MicroTracker) OnQuoteWithExch(tsSIP, tsPart int64, bid, ask float64, bidExch int16) {
+	if bid <= 0 || ask <= 0 {
 		return
 	}
-	slot := m.lastBucketIdx & (numMicroBuckets - 1)
-	b := &m.buckets[slot]
-	b.tradeCount++
-	b.tradeVol += size
-	b.tradeNotional += price * size
-	if m.lastMid > 0 {
-		if price >= m.lastMid {
-			b.signedTradeVol += size
-		} else {
-			b.signedTradeVol -= size
+	if tsPart <= 0 {
+		tsPart = tsSIP
+	}
+	mid := 0.5 * (bid + ask)
+	m.seedBid = bid
+	m.seedAsk = ask
+	m.seedMid = mid
+	if tsSIP > m.maxTS {
+		m.maxTS = tsSIP
+	}
+	if !m.initialized {
+		m.lastIsBuy = true
+		m.initialized = true
+	}
+
+	// Track venueLatest for hybrid Lee-Ready classification (matching SymbolHistory.recordCCMQuoteState)
+	if bidExch >= 0 && int(bidExch) < len(m.venueLatest) {
+		m.venueLatest[bidExch] = ccmQuoteEntry{
+			sipNS:  tsSIP,
+			partNS: tsPart,
+			bidPx:  bid,
+			askPx:  ask,
+			valid:  true,
 		}
+	}
+
+	// Deduplicate consecutive identical NBBO quotes
+	if m.qCount > 0 {
+		tailIdx := (m.qHead + m.qCount - 1) & (maxMicroQuotes - 1)
+		lastQ := &m.quotes[tailIdx]
+		if lastQ.bid == bid && lastQ.ask == ask && lastQ.bidExch == bidExch && tsSIP >= lastQ.tsNS {
+			return
+		}
+	}
+
+	q := microQuote{
+		tsNS:    tsSIP,
+		partNS:  tsPart,
+		bid:     bid,
+		ask:     ask,
+		mid:     mid,
+		bidExch: bidExch,
+	}
+
+	if m.qCount < maxMicroQuotes {
+		tailIdx := (m.qHead + m.qCount) & (maxMicroQuotes - 1)
+		m.quotes[tailIdx] = q
+		m.qCount++
+	} else {
+		m.quotes[m.qHead] = q
+		m.qHead = (m.qHead + 1) & (maxMicroQuotes - 1)
+	}
+
+	// Prune quotes older than maxTS - 35s from head
+	cutoffNS := m.maxTS - 35_000_000_000
+	for m.qCount > 1 && m.quotes[m.qHead].tsNS < cutoffNS {
+		m.qHead = (m.qHead + 1) & (maxMicroQuotes - 1)
+		m.qCount--
 	}
 }
 
-func (m *MicroTracker) bucketAtLag(lag int64) *microBucket {
-	bIdx := m.lastBucketIdx - lag
-	slot := bIdx & (numMicroBuckets - 1)
-	return &m.buckets[slot]
+func (m *MicroTracker) classifyTrade(tsSIP, tsPart int64, price float64, tradeExch int16) bool {
+	if tsPart <= 0 {
+		tsPart = tsSIP
+	}
+	targetSIP := tsSIP - 1_000_000
+
+	var candA ccmQuoteEntry
+	if m.qCount == 0 {
+		candA = ccmQuoteEntry{sipNS: 0, bidPx: m.seedBid, askPx: m.seedAsk, valid: (m.seedBid > 0 && m.seedAsk > 0)}
+	} else {
+		firstQ := &m.quotes[m.qHead]
+		if targetSIP < firstQ.tsNS {
+			candA = ccmQuoteEntry{sipNS: firstQ.tsNS, partNS: firstQ.partNS, bidPx: firstQ.bid, askPx: firstQ.ask, valid: true}
+		} else {
+			lastIdx := (m.qHead + m.qCount - 1) & (maxMicroQuotes - 1)
+			lastQ := &m.quotes[lastIdx]
+			if targetSIP >= lastQ.tsNS {
+				candA = ccmQuoteEntry{sipNS: lastQ.tsNS, partNS: lastQ.partNS, bidPx: lastQ.bid, askPx: lastQ.ask, valid: true}
+			} else {
+				i := sort.Search(m.qCount, func(k int) bool {
+					idx := (m.qHead + k) & (maxMicroQuotes - 1)
+					return m.quotes[idx].tsNS > targetSIP
+				})
+				if i > 0 {
+					i--
+				}
+				idx := (m.qHead + i) & (maxMicroQuotes - 1)
+				q := &m.quotes[idx]
+				candA = ccmQuoteEntry{sipNS: q.tsNS, partNS: q.partNS, bidPx: q.bid, askPx: q.ask, valid: true}
+			}
+		}
+	}
+
+	qChoice := candA
+	if tradeExch >= 0 && int(tradeExch) < len(m.venueLatest) {
+		candB := m.venueLatest[tradeExch]
+		if candB.valid && candB.sipNS <= tsSIP && candB.partNS <= tsPart && candB.sipNS > candA.sipNS {
+			qChoice = candB
+		}
+	}
+	if qChoice.sipNS > tsSIP {
+		qChoice = candA
+	}
+
+	var midPx float64 = math.NaN()
+	if qChoice.valid && qChoice.bidPx > 0 && qChoice.askPx > 0 {
+		midPx = 0.5 * (qChoice.bidPx + qChoice.askPx)
+	}
+
+	isBuy := m.lastIsBuy
+	if !math.IsNaN(midPx) {
+		if price > midPx {
+			isBuy = true
+		} else if price < midPx {
+			isBuy = false
+		} else if m.hasPrevTrade {
+			if price > m.prevTradePx {
+				isBuy = true
+			} else if price < m.prevTradePx {
+				isBuy = false
+			}
+		}
+	} else if m.hasPrevTrade {
+		if price > m.prevTradePx {
+			isBuy = true
+		} else if price < m.prevTradePx {
+			isBuy = false
+		}
+	}
+
+	m.prevTradePx = price
+	m.hasPrevTrade = true
+	m.lastIsBuy = isBuy
+	return isBuy
+}
+
+// OnTrade records an incoming trade using tsNS for both SIP and participant timestamps.
+func (m *MicroTracker) OnTrade(tsNS int64, price, size float64) {
+	m.OnTradeWithExch(tsNS, tsNS, price, size, 0)
+}
+
+// OnTradeWithExch records an incoming trade with exchange metadata and applies project_to_1hz Lee-Ready classification.
+func (m *MicroTracker) OnTradeWithExch(tsSIP, tsPart int64, price, size float64, tradeExch int16) {
+	if price <= 0 || size <= 0 {
+		return
+	}
+	if tsSIP > m.maxTS {
+		m.maxTS = tsSIP
+	}
+	if !m.initialized {
+		m.lastIsBuy = true
+		m.initialized = true
+	}
+
+	isBuy := m.classifyTrade(tsSIP, tsPart, price, tradeExch)
+
+	trade := microTrade{
+		tsNS:  tsSIP,
+		price: price,
+		size:  size,
+		isBuy: isBuy,
+	}
+
+	if m.tCount < maxMicroTrades {
+		tailIdx := (m.tHead + m.tCount) & (maxMicroTrades - 1)
+		m.trades[tailIdx] = trade
+		m.tCount++
+	} else {
+		m.trades[m.tHead] = trade
+		m.tHead = (m.tHead + 1) & (maxMicroTrades - 1)
+	}
+
+	// Prune trades older than maxTS - 10s from head
+	cutoffNS := m.maxTS - 10_000_000_000
+	for m.tCount > 0 && m.trades[m.tHead].tsNS < cutoffNS {
+		m.tHead = (m.tHead + 1) & (maxMicroTrades - 1)
+		m.tCount--
+	}
+}
+
+// quoteAt binary searches for the latest quote with tsNS <= targetTS.
+func (m *MicroTracker) quoteAt(targetTS int64) (float64, float64, float64) {
+	if m.qCount == 0 {
+		return m.seedBid, m.seedAsk, m.seedMid
+	}
+	firstQ := &m.quotes[m.qHead]
+	if targetTS < firstQ.tsNS {
+		if firstQ.bid > 0 {
+			return firstQ.bid, firstQ.ask, firstQ.mid
+		}
+		return m.seedBid, m.seedAsk, m.seedMid
+	}
+	lastIdx := (m.qHead + m.qCount - 1) & (maxMicroQuotes - 1)
+	lastQ := &m.quotes[lastIdx]
+	if targetTS >= lastQ.tsNS {
+		return lastQ.bid, lastQ.ask, lastQ.mid
+	}
+
+	i := sort.Search(m.qCount, func(k int) bool {
+		idx := (m.qHead + k) & (maxMicroQuotes - 1)
+		return m.quotes[idx].tsNS > targetTS
+	})
+	if i > 0 {
+		i--
+	}
+	idx := (m.qHead + i) & (maxMicroQuotes - 1)
+	return m.quotes[idx].bid, m.quotes[idx].ask, m.quotes[idx].mid
 }
 
 // ComputeSnapshot populates out with rolling lookback mids/bids/asks, 5s quote volatility,
@@ -408,38 +554,40 @@ func (m *MicroTracker) ComputeSnapshot(tsNS int64, out *shm.SymbolMicroSnapshot)
 	if out == nil {
 		return
 	}
-	if tsNS > 0 {
-		m.advanceTo(tsNS)
-		out.SIPTimestampNS = tsNS
+	if tsNS > m.maxTS {
+		m.maxTS = tsNS
 	}
-	if !m.initialized {
-		out.Mid1sAgo = m.lastMid
-		out.Mid2sAgo = m.lastMid
-		out.Mid3sAgo = m.lastMid
-		out.Mid5sAgo = m.lastMid
-		out.Mid10sAgo = m.lastMid
-		out.Mid30sAgo = m.lastMid
-		out.Bid5sAgo = m.lastBid
-		out.Ask5sAgo = m.lastAsk
+	nowTS := m.maxTS
+	if nowTS <= 0 {
+		return
+	}
+	out.SIPTimestampNS = nowTS
+
+	if !m.initialized && m.qCount == 0 {
+		out.Mid1sAgo = m.seedMid
+		out.Mid2sAgo = m.seedMid
+		out.Mid3sAgo = m.seedMid
+		out.Mid5sAgo = m.seedMid
+		out.Mid10sAgo = m.seedMid
+		out.Mid30sAgo = m.seedMid
+		out.Bid5sAgo = m.seedBid
+		out.Ask5sAgo = m.seedAsk
 		return
 	}
 
-	out.Mid1sAgo = m.bucketAtLag(4).mid
-	out.Mid2sAgo = m.bucketAtLag(8).mid
-	out.Mid3sAgo = m.bucketAtLag(12).mid
-	b5 := m.bucketAtLag(20)
-	out.Mid5sAgo = b5.mid
-	out.Bid5sAgo = b5.bid
-	out.Ask5sAgo = b5.ask
-	out.Mid10sAgo = m.bucketAtLag(40).mid
-	out.Mid30sAgo = m.bucketAtLag(120).mid
+	_, _, out.Mid1sAgo = m.quoteAt(nowTS - 1_000_000_000)
+	_, _, out.Mid2sAgo = m.quoteAt(nowTS - 2_000_000_000)
+	_, _, out.Mid3sAgo = m.quoteAt(nowTS - 3_000_000_000)
+	out.Bid5sAgo, out.Ask5sAgo, out.Mid5sAgo = m.quoteAt(nowTS - 5_000_000_000)
+	_, _, out.Mid10sAgo = m.quoteAt(nowTS - 10_000_000_000)
+	_, _, out.Mid30sAgo = m.quoteAt(nowTS - 30_000_000_000)
 
-	// 5s quote volatility (std of 20 bucket-to-bucket mid returns in bps)
+	// 5s quote volatility (std of 20 250ms mid returns in bps across m.quoteAt(nowTS - k*250_000_000))
 	var sumR, sumR2 float64
 	const nQ = 20
-	for lag := int64(nQ); lag >= 1; lag-- {
-		m0 := m.bucketAtLag(lag).mid
-		m1 := m.bucketAtLag(lag - 1).mid
+	for k := int64(nQ); k >= 1; k-- {
+		_, _, m0 := m.quoteAt(nowTS - k*250_000_000)
+		_, _, m1 := m.quoteAt(nowTS - (k-1)*250_000_000)
 		var r float64
 		if m0 > 0 && m1 > 0 {
 			r = ((m1 - m0) / m0) * 10000.0
@@ -455,23 +603,45 @@ func (m *MicroTracker) ComputeSnapshot(tsNS int64, out *shm.SymbolMicroSnapshot)
 		out.QuoteVol5sBps = 0.0
 	}
 
-	// 3s trade count (last 12 buckets: lag 0..11) and 5s trade aggregates (last 20 buckets: lag 0..19)
+	// 3s trade count (t.tsNS > nowTS - 3s && t.tsNS <= nowTS)
+	// 5s trade aggregates (t.tsNS > nowTS - 5s && t.tsNS <= nowTS)
+	t3sCutoff := nowTS - 3_000_000_000
+	t5sCutoff := nowTS - 5_000_000_000
+
 	var cnt3s uint32
-	var vol5s, notl5s, signed5s float64
-	for lag := int64(0); lag < 20; lag++ {
-		b := m.bucketAtLag(lag)
-		if lag < 12 {
-			cnt3s += b.tradeCount
+	var vol5s, notl5s, buyVol5s, sellVol5s float64
+
+	for k := m.tCount - 1; k >= 0; k-- {
+		idx := (m.tHead + k) & (maxMicroTrades - 1)
+		t := &m.trades[idx]
+		if t.tsNS <= t5sCutoff {
+			break
 		}
-		vol5s += b.tradeVol
-		notl5s += b.tradeNotional
-		signed5s += b.signedTradeVol
+		if t.tsNS > nowTS {
+			continue
+		}
+		vol5s += t.size
+		notl5s += t.price * t.size
+		if t.isBuy {
+			buyVol5s += t.size
+		} else {
+			sellVol5s += t.size
+		}
+		if t.tsNS > t3sCutoff {
+			cnt3s++
+		}
 	}
+
 	out.TradeCount3s = cnt3s
 	out.TradeVol5s = vol5s
 	if vol5s > 0 {
 		out.VWAP5s = notl5s / vol5s
-		out.TradeImbalance5s = signed5s / vol5s
+		denom := buyVol5s + sellVol5s
+		if denom > 0 {
+			out.TradeImbalance5s = (buyVol5s - sellVol5s) / denom
+		} else {
+			out.TradeImbalance5s = 0.0
+		}
 	} else {
 		out.VWAP5s = 0.0
 		out.TradeImbalance5s = 0.0

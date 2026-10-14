@@ -491,7 +491,7 @@ func TestProjectorMicroSnapshot(t *testing.T) {
 				SIPTimestampNS: ts + 10_000_000,
 				Symbol:         "AAPL",
 				Type:           feed.TickTrade,
-				Price:          ask,
+				Price:          103.10,
 				Size:           100.0,
 			})
 		}

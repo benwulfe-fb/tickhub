@@ -292,7 +292,7 @@ def run_memory_growth_test(duration_sec: int = DEFAULT_DURATION_SEC):
         print("-" * 95)
 
         start_time = time.time()
-        poll_interval = 2.0  # 2s interval to minimize GC perturbation
+        poll_interval = 0.5  # 0.5s interval to accurately capture post-GC heap troughs without aliasing
 
         while time.time() - start_time < duration_sec:
             time.sleep(poll_interval)
