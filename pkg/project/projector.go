@@ -303,14 +303,20 @@ func (p *Projector) IngestPreWindowTick(tick feed.Tick) {
 	if !ok {
 		return
 	}
-	p.updateSnapshot(uIdx, tick)
 	if p.isCCM44 {
 		hist := p.uniqueHistories[uIdx]
 		if tick.Type == feed.TickTrade {
+			p.updateSnapshot(uIdx, tick)
 			hist.IngestPreWindowCCMTrade(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch)
 		} else {
+			if !hist.AcceptQuote(tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz) {
+				return
+			}
+			p.updateSnapshot(uIdx, tick)
 			hist.IngestPreWindowCCMQuote(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz, tick.BidExch, tick.AskExch)
 		}
+	} else {
+		p.updateSnapshot(uIdx, tick)
 	}
 }
 
@@ -358,6 +364,16 @@ func (p *Projector) IngestTick(tick feed.Tick) error {
 	}
 
 	if p.isCCM44 {
+		if tick.Type == feed.TickQuote {
+			uIdx, ok := p.symToUnique[tick.Symbol]
+			if !ok {
+				return nil
+			}
+			if !p.uniqueHistories[uIdx].AcceptQuote(tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz) {
+				return nil
+			}
+		}
+
 		if p.isLiveMode {
 			earliestTarget := p.nextSecondAnchorNS
 			for pIdx := range p.phases {

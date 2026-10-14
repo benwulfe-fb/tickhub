@@ -77,6 +77,14 @@ type SymbolHistory struct {
 	ccmLowAskPxNS   int64
 	barTradePxs     []float64
 	barTradeSzs     []float64
+
+	// Duplicate-NBBO restatement suppression state (ccm/live/massive_feed.py:510-528)
+	hasDedupBaseline   bool
+	dedupBidPx         float64
+	dedupAskPx         float64
+	dedupBidSz         float64
+	dedupAskSz         float64
+	dedupDroppedQuotes uint64
 }
 
 func (h *SymbolHistory) recalcSpread() {
@@ -487,6 +495,12 @@ func (h *SymbolHistory) InitCCM44() {
 	h.quoteBuf = make([]ccmQuoteEntry, 0, 512)
 	h.barTradePxs = make([]float64, 0, 256)
 	h.barTradeSzs = make([]float64, 0, 256)
+	h.hasDedupBaseline = false
+	h.dedupBidPx = 0.0
+	h.dedupAskPx = 0.0
+	h.dedupBidSz = 0.0
+	h.dedupAskSz = 0.0
+	h.dedupDroppedQuotes = 0
 	h.resetCCMBarAccumulators()
 }
 
@@ -557,6 +571,33 @@ func (h *SymbolHistory) recordCCMQuoteState(tsSIP, tsPart int64, bidPx, askPx, b
 			h.quoteGPtr -= keepFrom
 		}
 	}
+}
+
+// AcceptQuote evaluates wire-level duplicate NBBO restatement suppression per
+// ccm/live/massive_feed.py:510-528 and ccm_train/tape_source.py:71-105.
+// Invalid-priced quotes (!(bidPx > 0.0 && askPx > 0.0)) return false without updating the baseline.
+// Duplicate quotes with identical prices and sizes return false and increment dedupDroppedQuotes.
+// Quotes with NaN sizes never compare equal (NaN == NaN is false in Go IEEE 754) and are accepted.
+// Distinct valid quotes update the baseline and return true.
+func (h *SymbolHistory) AcceptQuote(bidPx, askPx, bidSz, askSz float64) bool {
+	if !(bidPx > 0.0 && askPx > 0.0) {
+		return false
+	}
+	if h.hasDedupBaseline && h.dedupBidPx == bidPx && h.dedupAskPx == askPx && h.dedupBidSz == bidSz && h.dedupAskSz == askSz {
+		h.dedupDroppedQuotes++
+		return false
+	}
+	h.hasDedupBaseline = true
+	h.dedupBidPx = bidPx
+	h.dedupAskPx = askPx
+	h.dedupBidSz = bidSz
+	h.dedupAskSz = askSz
+	return true
+}
+
+// DedupDroppedQuotes returns the total count of suppressed duplicate NBBO quote restatements.
+func (h *SymbolHistory) DedupDroppedQuotes() uint64 {
+	return h.dedupDroppedQuotes
 }
 
 // IngestPreWindowCCMQuote updates cumulative quote state prior to window start without bar accumulation.

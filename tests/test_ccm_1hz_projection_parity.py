@@ -47,7 +47,20 @@ def _load_arena_from_parquet(symbol: str, date_str: str, max_sip_ns: int):
 
     q_bid_raw = q_tbl["bid_price"].to_numpy()[:q_cut]
     q_ask_raw = q_tbl["ask_price"].to_numpy()[:q_cut]
-    q_valid = (q_bid_raw > 0.0) & (q_ask_raw > 0.0)
+    q_szb_raw = q_tbl["bid_size"].to_numpy()[:q_cut]
+    q_sza_raw = q_tbl["ask_size"].to_numpy()[:q_cut]
+    q_valid_px = (q_bid_raw > 0.0) & (q_ask_raw > 0.0)
+
+    # Duplicate NBBO restatement suppression (matching ccm/live/massive_feed.py and ccm_train/tape_source.py)
+    vi = np.flatnonzero(q_valid_px)
+    q_dedup_keep = np.zeros(len(q_bid_raw), dtype=bool)
+    if vi.size > 0:
+        q_dedup_keep[vi[0]] = True
+    if vi.size > 1:
+        vals = np.column_stack([q_bid_raw[vi], q_ask_raw[vi], q_szb_raw[vi], q_sza_raw[vi]])
+        q_dedup_keep[vi[1:]] = np.any(vals[1:] != vals[:-1], axis=1)
+
+    q_valid = q_valid_px & q_dedup_keep
     q_end = int(np.sum(q_valid))
 
     t_px_raw = t_tbl["price"].to_numpy()[:t_cut]
@@ -57,8 +70,8 @@ def _load_arena_from_parquet(symbol: str, date_str: str, max_sip_ns: int):
     arena = TickArena(size=max(q_end + 16, t_end + 16, 1024))
     arena.q_bid[:q_end] = q_bid_raw[q_valid]
     arena.q_ask[:q_end] = q_ask_raw[q_valid]
-    arena.q_szb[:q_end] = q_tbl["bid_size"].to_numpy()[:q_cut][q_valid]
-    arena.q_sza[:q_end] = q_tbl["ask_size"].to_numpy()[:q_cut][q_valid]
+    arena.q_szb[:q_end] = q_szb_raw[q_valid]
+    arena.q_sza[:q_end] = q_sza_raw[q_valid]
     arena.q_sip[:q_end] = q_sip_all[:q_cut][q_valid]
     arena.q_part[:q_end] = q_tbl["participant_timestamp"].to_numpy()[:q_cut][q_valid]
     arena.q_exch[:q_end] = q_tbl["bid_exchange"].to_numpy()[:q_cut][q_valid].astype(np.int16)
