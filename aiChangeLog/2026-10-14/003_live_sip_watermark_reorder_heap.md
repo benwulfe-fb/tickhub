@@ -223,5 +223,5 @@ This ledger implements a SIP-watermark-based reordering min-heap (`tickMinHeap`)
 - [x] Add unit tests in `pkg/project/live_reorder_test.go`
 - [x] Pass `scripts/validate_all.py` in `/mnt/wc/worktrees/tickhub_dedupe`
 - [x] Pass `scripts/codereview.py`
-- [ ] Rebuild `/mnt/wc/tickhub/bin/tickhub` and pass parity test in `ccm_tickhub_1hz`
-- [ ] Merge into `main` and push to `origin/main`
+- [x] Rebuild `/mnt/wc/tickhub/bin/tickhub` and pass parity test in `ccm_tickhub_1hz`
+- [x] Merge into `main` and push to `origin/main`
