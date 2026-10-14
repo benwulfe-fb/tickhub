@@ -50,6 +50,58 @@ from .abi import (
 from .atomic import cpu_pause, load_acquire_i64, thread_fence_acquire, thread_fence_release
 
 
+CCM_44_FEATURES: tuple[str, ...] = (
+    "buy_volume",
+    "sell_volume",
+    "buy_notional",
+    "sell_notional",
+    "buy_trade_count",
+    "sell_trade_count",
+    "buy_mid_delta_notional",
+    "sell_mid_delta_notional",
+    "bid_quote_count",
+    "ask_quote_count",
+    "dark_bid_trade_primitive",
+    "dark_ask_trade_primitive",
+    "nbbo_quote_rate_primitive",
+    "nbbo_staleness_ms_primitive",
+    "exchanges_at_bb_primitive",
+    "exchanges_at_bo_primitive",
+    "high_px",
+    "low_px",
+    "high_bid_px",
+    "low_bid_px",
+    "high_ask_px",
+    "low_ask_px",
+    "last_bid_px",
+    "last_ask_px",
+    "last_bid_sz",
+    "last_ask_sz",
+    "last_trade_px",
+    "sip_timestamp",
+    "trade_vol_std_px",
+    "trade_vol_skew",
+    "high_px_ns",
+    "low_px_ns",
+    "high_ask_px_ns",
+    "low_ask_px_ns",
+    "quote_idx",
+    "trade_idx",
+    "asof_bid_px",
+    "asof_ask_px",
+    "asof_bid_sz",
+    "asof_ask_sz",
+    "asof_trade_px",
+    "asof_sip_timestamp",
+    "asof_quote_idx",
+    "asof_trade_idx",
+)
+
+_CCM_ZERO_KEYS: tuple[str, ...] = CCM_44_FEATURES[0:16]
+_CCM_NAN_KEYS: tuple[str, ...] = CCM_44_FEATURES[16:30]
+_CCM_INT64_KEYS: tuple[str, ...] = CCM_44_FEATURES[30:34]
+
+
 class HeartbeatTimeoutError(Exception):
     """Raised when the TickHub daemon heartbeat has stalled > 3.0s."""
     pass
@@ -968,6 +1020,248 @@ class TickHubReader:
             np_view[i, :n_feat] = row
 
         return steps_loaded
+
+    def load_window_1hz(
+        self,
+        symbol: str,
+        anchor_ns: int,
+        span_s: int = 360,
+        out_dict: Optional[dict[str, Any]] = None,
+        timeout_ms: float = 50.0,
+    ) -> Optional[dict[str, Any]]:
+        """Loads a `span_s + 1`-row 1Hz projection dict directly from the 44-slot SHM ring buffer.
+
+        Rows `0 .. span_s - 1` hold the `span_s` whole-second 1Hz bars strictly preceding
+        `floor(anchor_ns / 1s) * 1s` (`[anchor_floor_ns - span_s * 1s, anchor_floor_ns)`).
+        Row `span_s` holds the terminal point-in-time state as of `anchor_ns`.
+        """
+        anchor_ns_i = int(anchor_ns)
+        anchor_floor_ns = (anchor_ns_i // self.cadence_ns) * self.cadence_ns
+        offset_ms = (anchor_ns_i - anchor_floor_ns) // 1_000_000
+
+        chosen_p_idx = -1
+        chosen_s_idx = -1
+        phase_anchor_ns = anchor_floor_ns
+
+        # 1. Exact phase offset match containing symbol
+        for p_idx in range(self.num_phases):
+            p_name = self._phase_idx_to_name[p_idx]
+            s_map = self._phase_sym_to_idx.get(p_name, {})
+            if symbol in s_map and int(self._phase_infos[p_idx].offset_ms) == offset_ms:
+                chosen_p_idx = p_idx
+                chosen_s_idx = s_map[symbol]
+                phase_anchor_ns = anchor_floor_ns + int(self._phase_infos[p_idx].offset_ms) * 1_000_000
+                break
+
+        # 2. Fallback: pick phase containing symbol whose anchor in [anchor_floor_ns, anchor_ns_i] is largest
+        if chosen_p_idx < 0:
+            best_anchor = -1
+            for p_idx in range(self.num_phases):
+                p_name = self._phase_idx_to_name[p_idx]
+                s_map = self._phase_sym_to_idx.get(p_name, {})
+                if symbol not in s_map:
+                    continue
+                cand_anchor = anchor_floor_ns + int(self._phase_infos[p_idx].offset_ms) * 1_000_000
+                if cand_anchor <= anchor_ns_i and cand_anchor > best_anchor:
+                    best_anchor = cand_anchor
+                    chosen_p_idx = p_idx
+                    chosen_s_idx = s_map[symbol]
+                    phase_anchor_ns = cand_anchor
+
+        # 3. Final fallback: first phase containing symbol
+        if chosen_p_idx < 0:
+            for p_idx in range(self.num_phases):
+                p_name = self._phase_idx_to_name[p_idx]
+                s_map = self._phase_sym_to_idx.get(p_name, {})
+                if symbol in s_map:
+                    chosen_p_idx = p_idx
+                    chosen_s_idx = s_map[symbol]
+                    phase_anchor_ns = anchor_floor_ns + int(self._phase_infos[p_idx].offset_ms) * 1_000_000
+                    break
+
+        if chosen_p_idx < 0:
+            raise KeyError(f"Symbol '{symbol}' not found in any configured phase")
+
+        p_info = self._phase_infos[chosen_p_idx]
+        n_sym = int(p_info.num_symbols)
+        n_feat = int(p_info.num_features)
+        if n_feat < 44:
+            raise ValueError(f"load_window_1hz requires 44-feature CCM schema, found num_features={n_feat}")
+
+        # Wait up to timeout_ms for the target frame at phase_anchor_ns to be committed
+        target_slot = (phase_anchor_ns // self.cadence_ns) & (self.max_frames - 1)
+        target_frame_off = p_info.ring_offset_bytes + target_slot * p_info.frame_stride_bytes
+        target_anchor_addr = self._base_addr + target_frame_off + 64 + chosen_s_idx * 8
+
+        timeout_ns = int(timeout_ms * 1_000_000)
+        t0 = time.time_ns()
+        while True:
+            loaded_target = load_acquire_i64(target_anchor_addr)
+            if loaded_target == phase_anchor_ns:
+                break
+            if loaded_target > phase_anchor_ns or (time.time_ns() - t0) >= timeout_ns or self.status == 4:
+                return None
+            cpu_pause()
+
+        oldest_anchor_ns = phase_anchor_ns - (span_s - 1) * self.cadence_ns
+        raw_mat = np.empty((span_s, 44), dtype=np.float64)
+
+        for i in range(span_s):
+            step_anchor = oldest_anchor_ns + i * self.cadence_ns
+            slot = (step_anchor // self.cadence_ns) & (self.max_frames - 1)
+            frame_off = p_info.ring_offset_bytes + slot * p_info.frame_stride_bytes
+            anchor_addr = self._base_addr + frame_off + 64 + chosen_s_idx * 8
+
+            if load_acquire_i64(anchor_addr) != step_anchor:
+                return None
+
+            feat_off = frame_off + 64 + n_sym * 8 + chosen_s_idx * n_feat * 8
+            raw_mat[i, :] = np.frombuffer(
+                self._mmap,
+                dtype=np.float64,
+                count=44,
+                offset=feat_off,
+            )
+            if load_acquire_i64(anchor_addr) != step_anchor:
+                return None
+
+        sample_len = span_s + 1
+        s_start = anchor_floor_ns - span_s * self.cadence_ns
+        grid_window = s_start + np.arange(sample_len, dtype=np.int64) * self.cadence_ns
+
+        if out_dict is None:
+            proj_res: dict[str, Any] = {
+                "quote_idx": np.zeros(sample_len, dtype=np.int32),
+                "trade_idx": np.zeros(sample_len, dtype=np.int32),
+                "sample_len": sample_len,
+                "anchor_timestamp": grid_window,
+            }
+            for k in _CCM_ZERO_KEYS:
+                proj_res[k] = np.zeros(sample_len, dtype=np.float64)
+            for k in _CCM_NAN_KEYS:
+                proj_res[k] = np.full(sample_len, np.nan, dtype=np.float64)
+            for k in _CCM_INT64_KEYS:
+                proj_res[k] = np.zeros(sample_len, dtype=np.int64)
+        else:
+            proj_res = out_dict
+            proj_res["sample_len"] = sample_len
+            cur_grid = proj_res.get("anchor_timestamp")
+            if isinstance(cur_grid, np.ndarray) and cur_grid.shape == (sample_len,):
+                cur_grid[:] = grid_window
+            else:
+                proj_res["anchor_timestamp"] = grid_window
+            for k in ("quote_idx", "trade_idx"):
+                arr = proj_res.get(k)
+                if not isinstance(arr, np.ndarray) or arr.shape != (sample_len,) or arr.dtype != np.int32:
+                    proj_res[k] = np.zeros(sample_len, dtype=np.int32)
+            for k in _CCM_ZERO_KEYS:
+                arr = proj_res.get(k)
+                if not isinstance(arr, np.ndarray) or arr.shape != (sample_len,) or arr.dtype != np.float64:
+                    proj_res[k] = np.zeros(sample_len, dtype=np.float64)
+            for k in _CCM_NAN_KEYS:
+                arr = proj_res.get(k)
+                if not isinstance(arr, np.ndarray) or arr.shape != (sample_len,) or arr.dtype != np.float64:
+                    proj_res[k] = np.full(sample_len, np.nan, dtype=np.float64)
+            for k in _CCM_INT64_KEYS:
+                arr = proj_res.get(k)
+                if not isinstance(arr, np.ndarray) or arr.shape != (sample_len,) or arr.dtype != np.int64:
+                    proj_res[k] = np.zeros(sample_len, dtype=np.int64)
+
+        # Populate Slots 0..15 (zeros_keys)
+        for col_idx, k in enumerate(_CCM_ZERO_KEYS):
+            arr = proj_res[k]
+            arr[:span_s] = raw_mat[:, col_idx]
+            arr[span_s] = np.nan if k in ("exchanges_at_bb_primitive", "exchanges_at_bo_primitive") else 0.0
+
+        # Populate Slots 16..29 (nan_keys)
+        for offset_idx, k in enumerate(_CCM_NAN_KEYS):
+            col_idx = 16 + offset_idx
+            arr = proj_res[k]
+            arr[:span_s] = raw_mat[:, col_idx]
+            arr[span_s] = np.nan
+
+        # Populate Slots 30..33 (int64_keys reconstructed from bar_start_ns + offset)
+        bar_starts = grid_window[:span_s]
+        for offset_idx, k in enumerate(_CCM_INT64_KEYS):
+            col_idx = 30 + offset_idx
+            offs = raw_mat[:, col_idx]
+            arr = proj_res[k]
+            arr[:span_s] = np.where(offs < 0.0, np.int64(0), bar_starts + offs.astype(np.int64))
+            arr[span_s] = 0
+
+        # Populate Slots 34..35 (quote_idx, trade_idx) and Slots 36..43 (terminal row span_s)
+        term_row = raw_mat[span_s - 1]
+        q_idx_arr = proj_res["quote_idx"]
+        t_idx_arr = proj_res["trade_idx"]
+        q_idx_arr[:span_s] = raw_mat[:, 34].astype(np.int32)
+        q_idx_arr[span_s] = np.int32(int(term_row[42]))
+        t_idx_arr[:span_s] = raw_mat[:, 35].astype(np.int32)
+        t_idx_arr[span_s] = np.int32(int(term_row[43]))
+
+        lbp = proj_res["last_bid_px"]
+        lap = proj_res["last_ask_px"]
+        lbs = proj_res["last_bid_sz"]
+        las = proj_res["last_ask_sz"]
+        ltp = proj_res["last_trade_px"]
+        st = proj_res["sip_timestamp"]
+
+        lbp[span_s] = term_row[36]
+        lap[span_s] = term_row[37]
+        lbs[span_s] = term_row[38]
+        las[span_s] = term_row[39]
+        ltp[span_s] = term_row[40]
+        st[span_s] = term_row[41]
+
+        if self.is_replay_mode and getattr(self, "_writable", False) and oldest_anchor_ns > 0:
+            addr = self._base_addr + GlobalHeader.last_read_anchor_ns.offset
+            cur_read = ctypes.c_int64.from_address(addr).value
+            if oldest_anchor_ns > cur_read:
+                hb_addr = self._base_addr + GlobalHeader.consumer_heartbeat.offset
+                pid_addr = self._base_addr + GlobalHeader.consumer_pid.offset
+                ctypes.c_int64.from_address(pid_addr).value = os.getpid()
+                ctypes.c_int64.from_address(hb_addr).value = time.time_ns()
+                thread_fence_release()
+                ctypes.c_int64.from_address(addr).value = oldest_anchor_ns
+
+        # 1. Quote State Backfill (matching _projection_kernel_njit)
+        valid_q = np.flatnonzero(~np.isnan(lbp))
+        if valid_q.size > 0:
+            first_q = int(valid_q[0])
+            if first_q > 0:
+                lbp[:first_q] = lbp[first_q]
+                lap[:first_q] = lap[first_q]
+                lbs[:first_q] = lbs[first_q]
+                las[:first_q] = las[first_q]
+                st[:first_q] = st[first_q]
+                bb_fill_end = min(first_q, span_s)
+                proj_res["exchanges_at_bb_primitive"][:bb_fill_end] = 0.0
+                proj_res["exchanges_at_bo_primitive"][:bb_fill_end] = 0.0
+
+        # 2. Trade State Backfill (matching _projection_kernel_njit)
+        valid_t = np.flatnonzero(~np.isnan(ltp))
+        if valid_t.size > 0:
+            first_t = int(valid_t[0])
+            if first_t > 0:
+                ltp[:first_t] = ltp[first_t]
+
+        # 3. Volume std_px and skew causal forward-fill from 0.0 at window start (matching _projection_kernel_njit)
+        std_arr = proj_res["trade_vol_std_px"]
+        skew_arr = proj_res["trade_vol_skew"]
+        btc_arr = proj_res["buy_trade_count"]
+        stc_arr = proj_res["sell_trade_count"]
+        prev_std = 0.0
+        prev_skew = 0.0
+        for k in range(span_s):
+            if (btc_arr[k] + stc_arr[k]) == 0.0:
+                std_arr[k] = prev_std
+                skew_arr[k] = prev_skew
+            else:
+                prev_std = std_arr[k]
+                prev_skew = skew_arr[k]
+        std_arr[span_s] = prev_std
+        skew_arr[span_s] = prev_skew
+
+        return proj_res
 
     def close(self) -> None:
         """Closes memory map and underlying file descriptor."""

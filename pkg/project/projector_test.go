@@ -538,4 +538,104 @@ func TestProjectorMicroSnapshot(t *testing.T) {
 	}
 }
 
+func TestProjectorCCM44LiveSubSecondPhaseNoClobber(t *testing.T) {
+	phases := []shm.PhaseConfig{
+		{ID: 0, Name: "phase_0ms", OffsetMS: 0, Symbols: []string{"AAPL"}},
+		{ID: 1, Name: "phase_500ms", OffsetMS: 500, Symbols: []string{"AAPL"}},
+	}
+	feats := make([]string, 44)
+	for i := range feats {
+		feats[i] = "f"
+	}
+	cfg := shm.Config{
+		Name:            "test_proj_ccm44_live",
+		MaxFrames:       64,
+		Phases:          phases,
+		UniqueSymbols:   []string{"AAPL"},
+		Features:        feats,
+		CadenceInterval: 1 * time.Second,
+		Mode:            shm.ModeLiveStreaming,
+		UnlinkOnExit:    true,
+	}
+	prod, err := shm.CreateProducer(cfg)
+	if err != nil {
+		t.Fatalf("CreateProducer failed: %v", err)
+	}
+	defer prod.Close()
+
+	proj := NewProjector(prod, phases, []string{"AAPL"}, 1*time.Second)
+	proj.SetStartAnchor(99_000_000_000)
+
+	// In [99.0s, 100.0s): quote + buy trade of size 50 @ 100.10
+	_ = proj.IngestTick(feed.Tick{
+		SIPTimestampNS: 99_500_000_000,
+		Symbol:         "AAPL",
+		Type:           feed.TickQuote,
+		BidPx:          100.0,
+		AskPx:          100.10,
+		BidSz:          10.0,
+		AskSz:          10.0,
+	})
+	_ = proj.IngestTick(feed.Tick{
+		SIPTimestampNS: 99_600_000_000,
+		Symbol:         "AAPL",
+		Type:           feed.TickTrade,
+		Price:          100.10,
+		Size:           50.0,
+	})
+
+	// In [100.0s, 100.5s]: buy trade of size 200 @ 100.20 (belongs to [100.0s, 101.0s) bar, and terminal state @ 100.5s)
+	_ = proj.IngestTick(feed.Tick{
+		SIPTimestampNS: 100_200_000_000,
+		Symbol:         "AAPL",
+		Type:           feed.TickTrade,
+		Price:          100.20,
+		Size:           200.0,
+	})
+
+	// Tick @ 101.2s: flushes 100.0s (phase_0ms) and closes AAPL's [100.0s, 101.0s) bar before phase_500ms (100.5s) commits
+	_ = proj.IngestTick(feed.Tick{
+		SIPTimestampNS: 101_200_000_000,
+		Symbol:         "AAPL",
+		Type:           feed.TickTrade,
+		Price:          101.10,
+		Size:           300.0,
+	})
+
+	// Tick @ 101.6s: triggers Flush(100.6s), committing phase_500ms @ 100.5s
+	_ = proj.IngestTick(feed.Tick{
+		SIPTimestampNS: 101_600_000_000,
+		Symbol:         "AAPL",
+		Type:           feed.TickQuote,
+		BidPx:          102.0,
+		AskPx:          102.10,
+		BidSz:          10.0,
+		AskSz:          10.0,
+	})
+
+	barsP1 := prod.ReadHistoryBars(1, 0, 1)
+	if len(barsP1) != 1 {
+		t.Fatalf("expected 1 committed bar on phase_500ms, got %d", len(barsP1))
+	}
+	if barsP1[0].AnchorNS != 100_500_000_000 {
+		t.Fatalf("expected phase_500ms anchor 100.5s, got %d", barsP1[0].AnchorNS)
+	}
+	// Slot 0 (buy_vol for [99.0s, 100.0s)) must be 50.0, not clobbered by 200.0 from [100.0s, 101.0s)
+	if math.Abs(barsP1[0].Features[0]-50.0) > 1e-9 {
+		t.Fatalf("expected phase_500ms @ 100.5s buy_vol=50.0 ([99s,100s)), got %f", barsP1[0].Features[0])
+	}
+	// Slot 35 (bar_trade_idx @ 100.0s) must be 1, Slot 43 (term_trade_idx @ 100.5s) must be 2
+	if math.Abs(barsP1[0].Features[35]-1.0) > 1e-9 {
+		t.Fatalf("expected bar_trade_idx=1.0 @ 100.0s, got %f", barsP1[0].Features[35])
+	}
+	if math.Abs(barsP1[0].Features[43]-2.0) > 1e-9 {
+		t.Fatalf("expected term_trade_idx=2.0 @ 100.5s, got %f", barsP1[0].Features[43])
+	}
+	// Slot 40 (term_last_trade_px @ 100.5s) must be 100.20, not 101.10 from 101.2s
+	if math.Abs(barsP1[0].Features[40]-100.20) > 1e-9 {
+		t.Fatalf("expected term_last_trade_px=100.20 @ 100.5s, got %f", barsP1[0].Features[40])
+	}
+}
+
+
 

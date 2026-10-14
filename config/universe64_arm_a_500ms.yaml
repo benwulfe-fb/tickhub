@@ -1,18 +1,58 @@
 shm:
   name: tickhub_test_arm_a
-  max_frames: 64
+  max_frames: 512
   cadence_interval: 1000000000
 features:
-- log_ret_1s
-- log_ret_5s
-- log_ret_15s
-- vol_1s
-- spread_bps
+- buy_volume
+- sell_volume
+- buy_notional
+- sell_notional
+- buy_trade_count
+- sell_trade_count
+- buy_mid_delta_notional
+- sell_mid_delta_notional
+- bid_quote_count
+- ask_quote_count
+- dark_bid_trade_primitive
+- dark_ask_trade_primitive
+- nbbo_quote_rate_primitive
+- nbbo_staleness_ms_primitive
+- exchanges_at_bb_primitive
+- exchanges_at_bo_primitive
+- high_px
+- low_px
+- high_bid_px
+- low_bid_px
+- high_ask_px
+- low_ask_px
+- last_bid_px
+- last_ask_px
+- last_bid_sz
+- last_ask_sz
+- last_trade_px
+- sip_timestamp
+- trade_vol_std_px
+- trade_vol_skew
+- high_px_ns
+- low_px_ns
+- high_ask_px_ns
+- low_ask_px_ns
+- quote_idx
+- trade_idx
+- asof_bid_px
+- asof_ask_px
+- asof_bid_sz
+- asof_ask_sz
+- asof_trade_px
+- asof_sip_timestamp
+- asof_quote_idx
+- asof_trade_idx
 unique_symbols:
 - AAOI
 - ABBV
 - ADI
 - AGQ
+- ALAB
 - AMAT
 - ANET
 - APH
@@ -32,7 +72,6 @@ unique_symbols:
 - CSCO
 - DASH
 - DELL
-- ELVR
 - ETN
 - GE
 - GEV
@@ -86,6 +125,7 @@ phases:
   - ABBV
   - ADI
   - AGQ
+  - ALAB
   - AMAT
   - ANET
   - APH
@@ -105,7 +145,6 @@ phases:
   - CSCO
   - DASH
   - DELL
-  - ELVR
   - ETN
   - GE
   - GEV

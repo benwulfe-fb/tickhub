@@ -178,15 +178,17 @@ def test_empirical_cadence_ab():
             for k in common_keys:
                 fa = dict_a[k]
                 fb = dict_b[k]
-                diff = np.max(np.abs(fa - fb))
+                finite_mask = np.isfinite(fa) & np.isfinite(fb)
+                diff = float(np.max(np.abs(fa[finite_mask] - fb[finite_mask]))) if np.any(finite_mask) else 0.0
                 diffs.append(diff)
-                assert np.allclose(fa, fb, atol=1e-8), f"Feature mismatch for {k}: Arm A {fa} vs Arm B {fb}"
+                assert np.allclose(fa, fb, atol=1e-8, equal_nan=True), f"Feature mismatch for {k}: Arm A {fa} vs Arm B {fb}"
 
             print(f"Feature parity verification PASSED for {check_phase}: {len(common_keys)} common (anchor, symbol) frames evaluated. Max diff={max(diffs):.2e}")
 
         # 5. Check publish latency
         print(f"\nPublish latency: Arm A = {hdr_a['publish_latency_ns']/1000.0:.2f} us, Arm B = {hdr_b['publish_latency_ns']/1000.0:.2f} us")
-        assert hdr_b['publish_latency_ns'] < 100_000_000, f"Publish latency exceeded budget: {hdr_b['publish_latency_ns']} ns"
+        assert hdr_a['publish_latency_ns'] < 15_000_000, f"Arm A publish latency exceeded 15ms budget: {hdr_a['publish_latency_ns']} ns"
+        assert hdr_b['publish_latency_ns'] < 15_000_000, f"Arm B publish latency exceeded 15ms budget: {hdr_b['publish_latency_ns']} ns"
 
         print("\nAll empirical A/B assertions PASSED successfully!")
 
