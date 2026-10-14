@@ -7,12 +7,13 @@ HEADER_OFFSET = 0x00000000
 DIRECTORY_OFFSET = 0x00000400
 SNAPSHOT_OFFSET = 0x00001000
 CONFIG_AREA_OFFSET = 0x00005000
+MICRO_SNAPSHOT_OFFSET = 0x0000C000
 DATA_AREA_OFFSET = 0x00010000
 
 MAX_DIRECTORY_SYMBOLS = 192
 MAX_SNAPSHOT_SYMBOLS = 128
 MAX_PHASES = 8
-MAX_CONFIG_BYTES = 0x0000B000
+MAX_CONFIG_BYTES = 0x00007000
 
 STATUS_UNINITIALIZED = 0
 STATUS_BOOTING = 1
@@ -142,6 +143,27 @@ class SymbolSnapshot(ctypes.Structure):
     ]
 
 
+class SymbolMicroSnapshot(ctypes.Structure):
+    _fields_ = [
+        ("seqlock_seq", ctypes.c_uint64),
+        ("sip_timestamp_ns", ctypes.c_int64),
+        ("mid_1s_ago", ctypes.c_double),
+        ("mid_2s_ago", ctypes.c_double),
+        ("mid_3s_ago", ctypes.c_double),
+        ("mid_5s_ago", ctypes.c_double),
+        ("mid_10s_ago", ctypes.c_double),
+        ("mid_30s_ago", ctypes.c_double),
+        ("bid_5s_ago", ctypes.c_double),
+        ("ask_5s_ago", ctypes.c_double),
+        ("quote_vol_5s_bps", ctypes.c_double),
+        ("trade_vol_5s", ctypes.c_double),
+        ("vwap_5s", ctypes.c_double),
+        ("trade_imbalance_5s", ctypes.c_double),
+        ("trade_count_3s", ctypes.c_uint32),
+        ("_pad", ctypes.c_uint8 * 12),
+    ]
+
+
 class FrameHeader(ctypes.Structure):
     _fields_ = [
         ("anchor_ns", ctypes.c_int64),
@@ -161,6 +183,7 @@ assert ctypes.sizeof(ControlRequest) == 64, f"ControlRequest size mismatch: {cty
 assert ctypes.sizeof(ControlResponse) == 64, f"ControlResponse size mismatch: {ctypes.sizeof(ControlResponse)}"
 assert ctypes.sizeof(SymbolDirectoryEntry) == 16, f"SymbolDirectoryEntry size mismatch: {ctypes.sizeof(SymbolDirectoryEntry)}"
 assert ctypes.sizeof(SymbolSnapshot) == 128, f"SymbolSnapshot size mismatch: {ctypes.sizeof(SymbolSnapshot)}"
+assert ctypes.sizeof(SymbolMicroSnapshot) == 128, f"SymbolMicroSnapshot size mismatch: {ctypes.sizeof(SymbolMicroSnapshot)}"
 assert ctypes.sizeof(FrameHeader) == 64, f"FrameHeader size mismatch: {ctypes.sizeof(FrameHeader)}"
 
 # Cache line alignment checks

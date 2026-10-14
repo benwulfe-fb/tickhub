@@ -29,7 +29,9 @@ type Projector struct {
 	featBuffer       []float64
 	phaseFeatBuffers [][]float64
 
-	snapshots []shm.SymbolSnapshot
+	snapshots      []shm.SymbolSnapshot
+	microTrackers  []MicroTracker
+	microSnapshots []shm.SymbolMicroSnapshot
 
 	firstCommittedAnchor   int64
 	lastCommittedAnchor    int64
@@ -90,6 +92,8 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 		featBuffer:       make([]float64, 5),
 		phaseFeatBuffers: phaseFeatBuffers,
 		snapshots:        make([]shm.SymbolSnapshot, len(uniqueSymbols)),
+		microTrackers:    make([]MicroTracker, len(uniqueSymbols)),
+		microSnapshots:   make([]shm.SymbolMicroSnapshot, len(uniqueSymbols)),
 	}
 }
 
@@ -133,6 +137,11 @@ func (p *Projector) SeedState(symbol string, lastBid, lastAsk, lastPrice float64
 			snap.LastTradePx = lastPrice
 		}
 		p.producer.WriteSnapshot(uIdx, snap)
+		mt := &p.microTrackers[uIdx]
+		mt.SeedQuote(lastBid, lastAsk)
+		micro := &p.microSnapshots[uIdx]
+		mt.ComputeSnapshot(0, micro)
+		p.producer.WriteMicroSnapshot(uIdx, micro)
 	}
 }
 
@@ -314,10 +323,12 @@ func (p *Projector) updateSnapshot(uIdx int, tick feed.Tick) {
 	snap.SIPTimestampNS = tick.SIPTimestampNS
 	snap.RecvTimestampNS = tick.SIPTimestampNS
 
+	mt := &p.microTrackers[uIdx]
 	if tick.Type == feed.TickTrade {
 		snap.LastTradePx = tick.Price
 		snap.LastTradeSz = tick.Size
 		snap.Conditions++
+		mt.OnTrade(tick.SIPTimestampNS, tick.Price, tick.Size)
 	} else {
 		snap.BidPx = tick.BidPx
 		snap.AskPx = tick.AskPx
@@ -327,9 +338,13 @@ func (p *Projector) updateSnapshot(uIdx int, tick feed.Tick) {
 			snap.Midprice = (tick.BidPx + tick.AskPx) / 2.0
 			snap.Spread = tick.AskPx - tick.BidPx
 		}
+		mt.OnQuote(tick.SIPTimestampNS, tick.BidPx, tick.AskPx)
 	}
 
 	p.producer.WriteSnapshot(uIdx, snap)
+	micro := &p.microSnapshots[uIdx]
+	mt.ComputeSnapshot(tick.SIPTimestampNS, micro)
+	p.producer.WriteMicroSnapshot(uIdx, micro)
 }
 
 // Flush closes remaining bars up to targetEndNS.
@@ -342,6 +357,16 @@ func (p *Projector) Flush(targetEndNS int64) error {
 			}
 			p.phaseNextAnchor[pIdx] += p.cadenceNS
 			p.phaseSlots[pIdx]++
+		}
+	}
+	if targetEndNS > 0 {
+		for uIdx := range p.microTrackers {
+			mt := &p.microTrackers[uIdx]
+			if mt.initialized {
+				micro := &p.microSnapshots[uIdx]
+				mt.ComputeSnapshot(targetEndNS, micro)
+				p.producer.WriteMicroSnapshot(uIdx, micro)
+			}
 		}
 	}
 	return nil

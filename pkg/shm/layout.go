@@ -6,16 +6,17 @@ const (
 	MagicBytes        uint64 = 0x5449434B48554231 // "TICKHUB1"
 	CurrentABIVersion uint32 = 1
 
-	HeaderOffset     uintptr = 0x00000000
-	DirectoryOffset  uintptr = 0x00000400
-	SnapshotOffset   uintptr = 0x00001000
-	ConfigAreaOffset uintptr = 0x00005000
-	DataAreaOffset   uintptr = 0x00010000 // 64 KB boundary (page aligned)
+	HeaderOffset        uintptr = 0x00000000
+	DirectoryOffset     uintptr = 0x00000400
+	SnapshotOffset      uintptr = 0x00001000
+	ConfigAreaOffset    uintptr = 0x00005000
+	MicroSnapshotOffset uintptr = 0x0000C000 // 128 symbols * 128B = 16 KB (0x0000C000 to 0x00010000)
+	DataAreaOffset      uintptr = 0x00010000 // 64 KB boundary (page aligned)
 
 	MaxDirectorySymbols = 192
 	MaxSnapshotSymbols  = 128
 	MaxPhases           = 8
-	MaxConfigBytes      = 0x0000B000 // 44 KB (0x00005000 to 0x00010000)
+	MaxConfigBytes      = 0x00007000 // 28 KB (0x00005000 to 0x0000C000)
 
 	// Status flags
 	StatusUninitialized uint32 = 0
@@ -158,6 +159,26 @@ type SymbolSnapshot struct {
 	_pad            [24]byte
 }
 
+// SymbolMicroSnapshot holds rolling sub-second microstructure summaries protected by a SeqLock (128 bytes).
+type SymbolMicroSnapshot struct {
+	SeqLockSeq       uint64
+	SIPTimestampNS   int64
+	Mid1sAgo         float64
+	Mid2sAgo         float64
+	Mid3sAgo         float64
+	Mid5sAgo         float64
+	Mid10sAgo        float64
+	Mid30sAgo        float64
+	Bid5sAgo         float64
+	Ask5sAgo         float64
+	QuoteVol5sBps    float64
+	TradeVol5s       float64
+	VWAP5s           float64
+	TradeImbalance5s float64
+	TradeCount3s     uint32
+	_pad             [12]byte
+}
+
 // FrameHeader starts each frame in a phase ring buffer (64 bytes).
 type FrameHeader struct {
 	AnchorNS         int64
@@ -176,6 +197,7 @@ var (
 	_ [64]byte   = [unsafe.Sizeof(ControlResponse{})]byte{}
 	_ [16]byte   = [unsafe.Sizeof(SymbolDirectoryEntry{})]byte{}
 	_ [128]byte  = [unsafe.Sizeof(SymbolSnapshot{})]byte{}
+	_ [128]byte  = [unsafe.Sizeof(SymbolMicroSnapshot{})]byte{}
 	_ [64]byte   = [unsafe.Sizeof(FrameHeader{})]byte{}
 	_ [32]byte   = [unsafe.Sizeof(PhaseInfo{})]byte{}
 

@@ -23,6 +23,7 @@ from .abi import (
     MODE_HISTORICAL_REPLAY,
     MODE_LIVE_STREAMING,
     SNAPSHOT_OFFSET,
+    MICRO_SNAPSHOT_OFFSET,
     CONFIG_AREA_OFFSET,
     MAX_CONFIG_BYTES,
     FLAG_COLD_START,
@@ -44,6 +45,7 @@ from .abi import (
     PhaseInfo,
     SymbolDirectoryEntry,
     SymbolSnapshot,
+    SymbolMicroSnapshot,
 )
 from .atomic import cpu_pause, load_acquire_i64, thread_fence_acquire, thread_fence_release
 
@@ -559,15 +561,18 @@ class TickHubReader:
         return all_cursors, steps_loaded
 
     def snapshot(self, symbol: str) -> dict[str, Any]:
-        """Performs a lock-free SeqLock read of the latest top-of-book snapshot for symbol."""
+        """Performs a lock-free SeqLock read of the latest top-of-book and rolling microstructure snapshot for symbol."""
         if symbol not in self._symbol_to_dir_idx:
             raise KeyError(f"Symbol '{symbol}' not found in directory")
 
         dir_idx = self._symbol_to_dir_idx[symbol]
         snap_offset = SNAPSHOT_OFFSET + dir_idx * 128
         seq_addr = self._base_addr + snap_offset
-
         snap = SymbolSnapshot.from_address(self._base_addr + snap_offset)
+
+        micro_offset = MICRO_SNAPSHOT_OFFSET + dir_idx * 128
+        micro_seq_addr = self._base_addr + micro_offset
+        micro = SymbolMicroSnapshot.from_address(self._base_addr + micro_offset)
 
         for _ in range(100):
             seq1 = load_acquire_i64(seq_addr)
@@ -594,7 +599,7 @@ class TickHubReader:
 
             seq2 = load_acquire_i64(seq_addr)
             if seq1 == seq2:
-                return {
+                out = {
                     "symbol": symbol,
                     "seq": seq1,
                     "bid_px": bid_px,
@@ -612,6 +617,44 @@ class TickHubReader:
                     "trade_exch": trade_exch,
                     "conditions": conditions,
                 }
+                for _ in range(100):
+                    mseq1 = load_acquire_i64(micro_seq_addr)
+                    if mseq1 & 1 != 0:
+                        cpu_pause()
+                        continue
+                    thread_fence_acquire()
+                    mid_1s = micro.mid_1s_ago
+                    mid_2s = micro.mid_2s_ago
+                    mid_3s = micro.mid_3s_ago
+                    mid_5s = micro.mid_5s_ago
+                    mid_10s = micro.mid_10s_ago
+                    mid_30s = micro.mid_30s_ago
+                    bid_5s = micro.bid_5s_ago
+                    ask_5s = micro.ask_5s_ago
+                    q_vol_5s = micro.quote_vol_5s_bps
+                    t_vol_5s = micro.trade_vol_5s
+                    vwap_5s = micro.vwap_5s
+                    t_imb_5s = micro.trade_imbalance_5s
+                    t_cnt_3s = micro.trade_count_3s
+                    thread_fence_acquire()
+                    mseq2 = load_acquire_i64(micro_seq_addr)
+                    if mseq1 == mseq2:
+                        out["mid_1s_ago"] = mid_1s
+                        out["mid_2s_ago"] = mid_2s
+                        out["mid_3s_ago"] = mid_3s
+                        out["mid_5s_ago"] = mid_5s
+                        out["mid_10s_ago"] = mid_10s
+                        out["mid_30s_ago"] = mid_30s
+                        out["bid_5s_ago"] = bid_5s
+                        out["ask_5s_ago"] = ask_5s
+                        out["quote_vol_5s_bps"] = q_vol_5s
+                        out["trade_vol_5s"] = t_vol_5s
+                        out["vwap_5s"] = vwap_5s
+                        out["trade_imbalance_5s"] = t_imb_5s
+                        out["trade_count_3s"] = int(t_cnt_3s)
+                        break
+                    cpu_pause()
+                return out
             cpu_pause()
 
         raise RuntimeError(f"SeqLock read contention timeout for symbol '{symbol}'")

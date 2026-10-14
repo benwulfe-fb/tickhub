@@ -46,17 +46,18 @@ var (
 
 // Producer manages writes into POSIX shared memory.
 type Producer struct {
-	cfg           Config
-	segment       *Segment
-	header        *GlobalHeader
-	snapshots     []*SymbolSnapshot
-	phaseOffsets  []uintptr
-	phaseStrides  []uintptr
-	symbolMap     map[string]int // symbol name -> directory index
-	phaseSymMap   []map[string]int // phase index -> (symbol name -> phase symbol index)
-	firstAnchorNS int64
-	downtimeNS    int64
-	missedAnchors uint64
+	cfg            Config
+	segment        *Segment
+	header         *GlobalHeader
+	snapshots      []*SymbolSnapshot
+	microSnapshots []*SymbolMicroSnapshot
+	phaseOffsets   []uintptr
+	phaseStrides   []uintptr
+	symbolMap      map[string]int   // symbol name -> directory index
+	phaseSymMap    []map[string]int // phase index -> (symbol name -> phase symbol index)
+	firstAnchorNS  int64
+	downtimeNS     int64
+	missedAnchors  uint64
 }
 
 // CreateProducer calculates memory requirements, allocates the segment, formats headers,
@@ -130,6 +131,7 @@ func CreateProducer(cfg Config) (*Producer, error) {
 	raw := seg.Bytes()
 	symMap := make(map[string]int)
 	snapshots := make([]*SymbolSnapshot, len(cfg.UniqueSymbols))
+	microSnapshots := make([]*SymbolMicroSnapshot, len(cfg.UniqueSymbols))
 
 	for i, s := range cfg.UniqueSymbols {
 		symMap[s] = i
@@ -143,6 +145,10 @@ func CreateProducer(cfg Config) (*Producer, error) {
 		// Point snapshot pointer to SnapshotOffset + i*128
 		snapPtr := (*SymbolSnapshot)(unsafe.Pointer(&raw[SnapshotOffset+uintptr(i*128)]))
 		snapshots[i] = snapPtr
+
+		// Point micro snapshot pointer to MicroSnapshotOffset + i*128
+		microPtr := (*SymbolMicroSnapshot)(unsafe.Pointer(&raw[MicroSnapshotOffset+uintptr(i*128)]))
+		microSnapshots[i] = microPtr
 	}
 
 	phaseSymMap := make([]map[string]int, len(cfg.Phases))
@@ -169,14 +175,15 @@ func CreateProducer(cfg Config) (*Producer, error) {
 	}
 
 	return &Producer{
-		cfg:          cfg,
-		segment:      seg,
-		header:       header,
-		snapshots:    snapshots,
-		phaseOffsets: phaseOffsets,
-		phaseStrides: phaseStrides,
-		symbolMap:    symMap,
-		phaseSymMap:  phaseSymMap,
+		cfg:            cfg,
+		segment:        seg,
+		header:         header,
+		snapshots:      snapshots,
+		microSnapshots: microSnapshots,
+		phaseOffsets:   phaseOffsets,
+		phaseStrides:   phaseStrides,
+		symbolMap:      symMap,
+		phaseSymMap:    phaseSymMap,
 	}, nil
 }
 
@@ -270,10 +277,13 @@ func CreateProducerWithRecovery(cfg Config) (*Producer, uint32, error) {
 				raw := seg.Bytes()
 				symMap := make(map[string]int)
 				snapshots := make([]*SymbolSnapshot, len(cfg.UniqueSymbols))
+				microSnapshots := make([]*SymbolMicroSnapshot, len(cfg.UniqueSymbols))
 				for i, s := range cfg.UniqueSymbols {
 					symMap[s] = i
 					snapPtr := (*SymbolSnapshot)(unsafe.Pointer(&raw[SnapshotOffset+uintptr(i*128)]))
 					snapshots[i] = snapPtr
+					microPtr := (*SymbolMicroSnapshot)(unsafe.Pointer(&raw[MicroSnapshotOffset+uintptr(i*128)]))
+					microSnapshots[i] = microPtr
 				}
 
 				phaseSymMap := make([]map[string]int, len(cfg.Phases))
@@ -311,16 +321,17 @@ func CreateProducerWithRecovery(cfg Config) (*Producer, uint32, error) {
 				atomic.StoreUint64(&hdr.BootID, newBootID)
 
 				prod := &Producer{
-					cfg:           cfg,
-					segment:       seg,
-					header:        hdr,
-					snapshots:     snapshots,
-					phaseOffsets:  phaseOffsets,
-					phaseStrides:  phaseStrides,
-					symbolMap:     symMap,
-					phaseSymMap:   phaseSymMap,
-					downtimeNS:    downtime,
-					missedAnchors: uint64(downtime / cadence),
+					cfg:            cfg,
+					segment:        seg,
+					header:         hdr,
+					snapshots:      snapshots,
+					microSnapshots: microSnapshots,
+					phaseOffsets:   phaseOffsets,
+					phaseStrides:   phaseStrides,
+					symbolMap:      symMap,
+					phaseSymMap:    phaseSymMap,
+					downtimeNS:     downtime,
+					missedAnchors:  uint64(downtime / cadence),
 				}
 				return prod, recMode, nil
 			}
@@ -373,6 +384,36 @@ func (p *Producer) WriteSnapshot(symbolIdx int, snap *SymbolSnapshot) {
 	target.AskExch = snap.AskExch
 	target.TradeExch = snap.TradeExch
 	target.Conditions = snap.Conditions
+
+	// 3. Advance SeqLock sequence to EVEN (Store-Release)
+	atomic.StoreUint64(&target.SeqLockSeq, seq+1)
+}
+
+// WriteMicroSnapshot performs a lock-free SeqLock write of rolling microstructure state for unique symbolIdx.
+func (p *Producer) WriteMicroSnapshot(symbolIdx int, micro *SymbolMicroSnapshot) {
+	if symbolIdx < 0 || symbolIdx >= len(p.microSnapshots) {
+		return
+	}
+	target := p.microSnapshots[symbolIdx]
+
+	// 1. Advance SeqLock sequence to ODD (Store-Release)
+	seq := atomic.AddUint64(&target.SeqLockSeq, 1)
+
+	// 2. Write fields
+	target.SIPTimestampNS = micro.SIPTimestampNS
+	target.Mid1sAgo = micro.Mid1sAgo
+	target.Mid2sAgo = micro.Mid2sAgo
+	target.Mid3sAgo = micro.Mid3sAgo
+	target.Mid5sAgo = micro.Mid5sAgo
+	target.Mid10sAgo = micro.Mid10sAgo
+	target.Mid30sAgo = micro.Mid30sAgo
+	target.Bid5sAgo = micro.Bid5sAgo
+	target.Ask5sAgo = micro.Ask5sAgo
+	target.QuoteVol5sBps = micro.QuoteVol5sBps
+	target.TradeVol5s = micro.TradeVol5s
+	target.VWAP5s = micro.VWAP5s
+	target.TradeImbalance5s = micro.TradeImbalance5s
+	target.TradeCount3s = micro.TradeCount3s
 
 	// 3. Advance SeqLock sequence to EVEN (Store-Release)
 	atomic.StoreUint64(&target.SeqLockSeq, seq+1)
@@ -657,6 +698,19 @@ func (p *Producer) Snapshot(symbolIdx int) *SymbolSnapshot {
 // Snapshots returns all symbol snapshots.
 func (p *Producer) Snapshots() []*SymbolSnapshot {
 	return p.snapshots
+}
+
+// MicroSnapshot returns the micro snapshot pointer for symbol directory index.
+func (p *Producer) MicroSnapshot(symbolIdx int) *SymbolMicroSnapshot {
+	if symbolIdx < 0 || symbolIdx >= len(p.microSnapshots) {
+		return nil
+	}
+	return p.microSnapshots[symbolIdx]
+}
+
+// MicroSnapshots returns all symbol micro snapshots.
+func (p *Producer) MicroSnapshots() []*SymbolMicroSnapshot {
+	return p.microSnapshots
 }
 
 // SetFrameFlags sets the Flags bitfield on the FrameHeader for phaseIdx at anchorNS.

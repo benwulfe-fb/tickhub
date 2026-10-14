@@ -451,4 +451,91 @@ func TestProjectorBulkCommitAndZeroAlloc(t *testing.T) {
 	}
 }
 
+func TestProjectorMicroSnapshot(t *testing.T) {
+	phases := []shm.PhaseConfig{
+		{ID: 0, Name: "phase_0ms", OffsetMS: 0, Symbols: []string{"AAPL"}},
+	}
+	cfg := shm.Config{
+		Name:            "test_proj_micro",
+		MaxFrames:       64,
+		Phases:          phases,
+		UniqueSymbols:   []string{"AAPL"},
+		Features:        []string{"r1", "r5", "r15", "v1", "sp"},
+		CadenceInterval: 1 * time.Second,
+		UnlinkOnExit:    true,
+	}
+	prod, err := shm.CreateProducer(cfg)
+	if err != nil {
+		t.Fatalf("CreateProducer failed: %v", err)
+	}
+	defer prod.Close()
+
+	proj := NewProjector(prod, phases, []string{"AAPL"}, 1*time.Second)
+	t0 := int64(1700000000_000_000_000)
+
+	// Step through 30 seconds (121 buckets of 250ms), increasing mid by +$0.10 every second
+	for b := int64(0); b <= 120; b++ {
+		ts := t0 + b*250_000_000
+		sec := float64(b / 4)
+		bid := 100.0 + sec*0.10
+		ask := bid + 0.10
+		_ = proj.IngestTick(feed.Tick{
+			SIPTimestampNS: ts,
+			Symbol:         "AAPL",
+			Type:           feed.TickQuote,
+			BidPx:          bid,
+			AskPx:          ask,
+		})
+		if b == 116 { // 1s ago (within 3s and 5s windows): buy trade above mid
+			_ = proj.IngestTick(feed.Tick{
+				SIPTimestampNS: ts + 10_000_000,
+				Symbol:         "AAPL",
+				Type:           feed.TickTrade,
+				Price:          ask,
+				Size:           100.0,
+			})
+		}
+		if b == 104 { // 4s ago (within 5s window, outside 3s window): sell trade below mid
+			_ = proj.IngestTick(feed.Tick{
+				SIPTimestampNS: ts + 10_000_000,
+				Symbol:         "AAPL",
+				Type:           feed.TickTrade,
+				Price:          bid,
+				Size:           50.0,
+			})
+		}
+	}
+
+	micro := prod.MicroSnapshot(0)
+	if micro == nil {
+		t.Fatalf("MicroSnapshot(0) returned nil")
+	}
+	// At b=120 (30s): current mid is 103.05, 1s ago (b=116, sec=29) mid is 102.95, 5s ago (b=100, sec=25) mid is 102.55, 30s ago (b=0, sec=0) mid is 100.05
+	if math.Abs(micro.Mid1sAgo-102.95) > 1e-6 {
+		t.Fatalf("expected Mid1sAgo=102.95, got %f", micro.Mid1sAgo)
+	}
+	if math.Abs(micro.Mid5sAgo-102.55) > 1e-6 {
+		t.Fatalf("expected Mid5sAgo=102.55, got %f", micro.Mid5sAgo)
+	}
+	if math.Abs(micro.Mid30sAgo-100.05) > 1e-6 {
+		t.Fatalf("expected Mid30sAgo=100.05, got %f", micro.Mid30sAgo)
+	}
+	if math.Abs(micro.Bid5sAgo-102.50) > 1e-6 || math.Abs(micro.Ask5sAgo-102.60) > 1e-6 {
+		t.Fatalf("expected Bid5sAgo=102.50 Ask5sAgo=102.60, got %f / %f", micro.Bid5sAgo, micro.Ask5sAgo)
+	}
+	if micro.QuoteVol5sBps <= 0 {
+		t.Fatalf("expected positive QuoteVol5sBps, got %f", micro.QuoteVol5sBps)
+	}
+	if micro.TradeCount3s != 1 {
+		t.Fatalf("expected TradeCount3s=1, got %d", micro.TradeCount3s)
+	}
+	if math.Abs(micro.TradeVol5s-150.0) > 1e-6 {
+		t.Fatalf("expected TradeVol5s=150.0, got %f", micro.TradeVol5s)
+	}
+	// Imbalance: +100 buy - 50 sell = +50 / 150 = +1/3
+	if math.Abs(micro.TradeImbalance5s-(1.0/3.0)) > 1e-6 {
+		t.Fatalf("expected TradeImbalance5s=0.333333, got %f", micro.TradeImbalance5s)
+	}
+}
+
 
