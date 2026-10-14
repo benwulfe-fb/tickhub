@@ -116,6 +116,7 @@ func TestProjectorIngestTickDuplicateSuppression(t *testing.T) {
 	defer prod.Close()
 
 	proj := NewProjector(prod, phases, []string{"AAPL"}, time.Second)
+	proj.SetWatermarkBuffer(0)
 	baseTS := int64(1_000_000_000)
 
 	// Ingest quote 1

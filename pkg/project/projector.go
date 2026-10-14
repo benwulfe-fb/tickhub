@@ -2,12 +2,92 @@ package project
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"time"
 
 	"github.com/benwulfe-fb/tickhub/pkg/feed"
 	"github.com/benwulfe-fb/tickhub/pkg/shm"
 )
+
+type liveTickItem struct {
+	tick feed.Tick
+	seq  uint64
+}
+
+type tickMinHeap struct {
+	items []liveTickItem
+}
+
+func (h *tickMinHeap) Len() int { return len(h.items) }
+
+func (h *tickMinHeap) less(i, j int) bool {
+	a, b := h.items[i], h.items[j]
+	if a.tick.SIPTimestampNS != b.tick.SIPTimestampNS {
+		return a.tick.SIPTimestampNS < b.tick.SIPTimestampNS
+	}
+	if a.tick.Type != b.tick.Type {
+		return a.tick.Type == feed.TickQuote
+	}
+	if a.tick.Symbol != b.tick.Symbol {
+		return a.tick.Symbol < b.tick.Symbol
+	}
+	return a.seq < b.seq
+}
+
+func (h *tickMinHeap) swap(i, j int) {
+	h.items[i], h.items[j] = h.items[j], h.items[i]
+}
+
+func (h *tickMinHeap) PushItem(item liveTickItem) {
+	h.items = append(h.items, item)
+	h.siftUp(len(h.items) - 1)
+}
+
+func (h *tickMinHeap) PopItem() liveTickItem {
+	n := len(h.items)
+	item := h.items[0]
+	h.items[0] = h.items[n-1]
+	h.items = h.items[:n-1]
+	if n > 1 {
+		h.siftDown(0)
+	}
+	return item
+}
+
+func (h *tickMinHeap) PeekItem() liveTickItem {
+	return h.items[0]
+}
+
+func (h *tickMinHeap) siftUp(i int) {
+	for i > 0 {
+		p := (i - 1) / 2
+		if !h.less(i, p) {
+			break
+		}
+		h.swap(i, p)
+		i = p
+	}
+}
+
+func (h *tickMinHeap) siftDown(i int) {
+	n := len(h.items)
+	for {
+		left := 2*i + 1
+		if left >= n {
+			break
+		}
+		smallest := left
+		if right := left + 1; right < n && h.less(right, left) {
+			smallest = right
+		}
+		if !h.less(smallest, i) {
+			break
+		}
+		h.swap(i, smallest)
+		i = smallest
+	}
+}
 
 // Projector aggregates ticks and commits 1Hz multi-phase features into POSIX SHM.
 type Projector struct {
@@ -50,6 +130,15 @@ type Projector struct {
 	lastCommittedAnchor    int64
 	totalCommittedFrames   int
 	coldStartBarsRemaining int
+
+	// Watermark reorder buffer and stream-time state (CCM 44 live mode)
+	watermarkBufferNS int64
+	maxSIPTimestampNS int64
+	maxSIPWallTime    time.Time
+	liveSeq           uint64
+	lateDroppedTicks  uint64
+	warnedLateDrop    bool
+	liveHeap          tickMinHeap
 }
 
 type phaseRef struct {
@@ -140,6 +229,13 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 		}
 	}
 
+	var liveHeap tickMinHeap
+	var watermarkBufferNS int64 = 0
+	if isLiveMode && isCCM44 {
+		watermarkBufferNS = 100_000_000 // 100ms default
+		liveHeap = tickMinHeap{items: make([]liveTickItem, 0, 16384)}
+	}
+
 	return &Projector{
 		producer:          producer,
 		cadenceNS:         cadenceNS,
@@ -150,6 +246,8 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 		symbolPhaseRefs:   symbolPhaseRefs,
 		isCCM44:           isCCM44,
 		isLiveMode:        isLiveMode,
+		watermarkBufferNS: watermarkBufferNS,
+		liveHeap:          liveHeap,
 		symNextSecondNS:   symNextSecondNS,
 		uniqueHistories:   uniqueHistories,
 		uniqueLastCCMBar:  uniqueLastCCMBar,
@@ -170,6 +268,39 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 // IsCCM44 returns true when the projector is configured with the 44-slot CCM 1Hz schema.
 func (p *Projector) IsCCM44() bool {
 	return p.isCCM44
+}
+
+// SetWatermarkBuffer overrides the watermark latency buffer.
+func (p *Projector) SetWatermarkBuffer(d time.Duration) {
+	p.watermarkBufferNS = d.Nanoseconds()
+}
+
+// WatermarkBuffer returns the configured watermark latency buffer duration.
+func (p *Projector) WatermarkBuffer() time.Duration {
+	return time.Duration(p.watermarkBufferNS) * time.Nanosecond
+}
+
+// MaxSIPTimestampNS returns the highest SIP timestamp observed across all ingested ticks.
+func (p *Projector) MaxSIPTimestampNS() int64 {
+	return p.maxSIPTimestampNS
+}
+
+// LateDroppedTicks returns the count of ticks dropped due to arriving after their bar closed.
+func (p *Projector) LateDroppedTicks() uint64 {
+	return p.lateDroppedTicks
+}
+
+// VirtualStreamNow returns the current virtual SIP stream time.
+// Anchored to maxSIPTimestampNS and advances 1:1 with wall-clock time during quiet periods.
+func (p *Projector) VirtualStreamNow(now time.Time) int64 {
+	if p.maxSIPTimestampNS == 0 {
+		return 0
+	}
+	elapsed := now.Sub(p.maxSIPWallTime).Nanoseconds()
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	return p.maxSIPTimestampNS + elapsed
 }
 
 // SetStartAnchor sets the initial window start anchor across all phases.
@@ -337,11 +468,10 @@ func (p *Projector) closeSecondBar(secAnchorNS int64) {
 	}
 }
 
-// IngestTick processes a market tick and commits completed 1Hz frames when time boundaries are crossed.
-func (p *Projector) IngestTick(tick feed.Tick) error {
+func (p *Projector) ingestSortedCCM44Tick(tick feed.Tick, updateSnap bool) error {
 	ts := tick.SIPTimestampNS
 
-	// 1. Initialize phase start anchors on first tick
+	// 1. Initialize phase start anchors on first sorted tick
 	for pIdx, pCfg := range p.phases {
 		if p.phaseNextAnchor[pIdx] == 0 {
 			offsetNS := int64(pCfg.OffsetMS) * 1_000_000
@@ -352,7 +482,7 @@ func (p *Projector) IngestTick(tick feed.Tick) error {
 			p.phaseNextAnchor[pIdx] = firstAnchor
 		}
 	}
-	if p.isCCM44 && p.nextSecondAnchorNS == 0 {
+	if p.nextSecondAnchorNS == 0 {
 		secAnchor := (ts / p.cadenceNS) * p.cadenceNS
 		if secAnchor <= ts {
 			secAnchor += p.cadenceNS
@@ -363,54 +493,26 @@ func (p *Projector) IngestTick(tick feed.Tick) error {
 		}
 	}
 
-	if p.isCCM44 {
-		if tick.Type == feed.TickQuote {
-			uIdx, ok := p.symToUnique[tick.Symbol]
-			if !ok {
-				return nil
-			}
-			if !p.uniqueHistories[uIdx].AcceptQuote(tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz) {
-				return nil
-			}
-		}
+	uIdx, ok := p.symToUnique[tick.Symbol]
+	if !ok {
+		return nil
+	}
 
-		if p.isLiveMode {
-			earliestTarget := p.nextSecondAnchorNS
-			for pIdx := range p.phases {
-				t := p.phaseNextAnchor[pIdx]
-				if t > 0 && (earliestTarget == 0 || t < earliestTarget) {
-					earliestTarget = t
-				}
-			}
-			if earliestTarget > 0 && ts >= earliestTarget+p.cadenceNS {
-				if err := p.Flush(ts - p.cadenceNS); err != nil {
-					return err
-				}
-			}
-			if uIdx, ok := p.symToUnique[tick.Symbol]; ok {
-				hist := p.uniqueHistories[uIdx]
-				for pIdx := range p.phases {
-					if !p.phaseAsOfCaptured[pIdx][uIdx] && ts > p.phaseNextAnchor[pIdx] {
-						var tmp [44]float64
-						hist.WriteCCMTerminalState(&tmp)
-						copy(p.phaseAsOf[pIdx][uIdx][:], tmp[36:44])
-						p.phaseAsOfCaptured[pIdx][uIdx] = true
-					}
-				}
-				for p.symNextSecondNS[uIdx] <= ts {
-					p.closeSymbolSecondBar(uIdx, p.symNextSecondNS[uIdx])
-				}
-				p.updateSnapshot(uIdx, tick)
-				if tick.Type == feed.TickTrade {
-					hist.IngestCCMTrade(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch, tick.IsDark)
-				} else {
-					hist.IngestCCMQuote(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz, tick.BidExch, tick.AskExch)
-				}
-			}
+	if tick.Type == feed.TickQuote {
+		if !p.uniqueHistories[uIdx].AcceptQuote(tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz) {
 			return nil
 		}
+	}
 
-		// Historical replay mode: globally sorted stream across all symbols
+	isLate := p.symNextSecondNS[uIdx] > 0 && ts < p.symNextSecondNS[uIdx]-p.cadenceNS
+	if isLate {
+		p.lateDroppedTicks++
+		if !p.warnedLateDrop {
+			p.warnedLateDrop = true
+			log.Printf("[PROJECTOR] Late tail tick past closed bar: %s %v ts=%d < boundary=%d (total: %d)",
+				tick.Symbol, tick.Type, ts, p.symNextSecondNS[uIdx]-p.cadenceNS, p.lateDroppedTicks)
+		}
+	} else {
 		for {
 			earliestPIdx := -1
 			var earliestPhaseAnchor int64 = 0
@@ -443,17 +545,84 @@ func (p *Projector) IngestTick(tick feed.Tick) error {
 			p.phaseNextAnchor[earliestPIdx] += p.cadenceNS
 			p.phaseSlots[earliestPIdx]++
 		}
+	}
 
-		if uIdx, ok := p.symToUnique[tick.Symbol]; ok {
-			p.updateSnapshot(uIdx, tick)
-			hist := p.uniqueHistories[uIdx]
-			if tick.Type == feed.TickTrade {
-				hist.IngestCCMTrade(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch, tick.IsDark)
-			} else {
-				hist.IngestCCMQuote(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz, tick.BidExch, tick.AskExch)
-			}
+	if updateSnap {
+		p.updateSnapshot(uIdx, tick)
+	}
+
+	hist := p.uniqueHistories[uIdx]
+	if tick.Type == feed.TickTrade {
+		if isLate {
+			hist.IngestPreWindowCCMTrade(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch)
+		} else {
+			hist.IngestCCMTrade(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch, tick.IsDark)
 		}
-		return nil
+	} else {
+		if isLate {
+			hist.IngestPreWindowCCMQuote(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz, tick.BidExch, tick.AskExch)
+		} else {
+			hist.IngestCCMQuote(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz, tick.BidExch, tick.AskExch)
+		}
+	}
+	return nil
+}
+
+// IngestTick processes a market tick and commits completed 1Hz frames when time boundaries are crossed.
+func (p *Projector) IngestTick(tick feed.Tick) error {
+	ts := tick.SIPTimestampNS
+
+	if p.isCCM44 {
+		uIdx, ok := p.symToUnique[tick.Symbol]
+		if !ok {
+			return nil
+		}
+
+		if p.isLiveMode {
+			// 1. Immediately update snapshot at wire arrival (0ms delay for live execution)
+			p.updateSnapshot(uIdx, tick)
+
+			// 2. Track max SIP timestamp and wall time
+			if ts > p.maxSIPTimestampNS {
+				p.maxSIPTimestampNS = ts
+				p.maxSIPWallTime = time.Now()
+			}
+
+			// 3. Push to min-heap
+			p.liveSeq++
+			p.liveHeap.PushItem(liveTickItem{
+				tick: tick,
+				seq:  p.liveSeq,
+			})
+
+			// 4. Drain heap up to watermark cutoff
+			cutoff := p.maxSIPTimestampNS - p.watermarkBufferNS
+			for p.liveHeap.Len() > 0 && p.liveHeap.PeekItem().tick.SIPTimestampNS <= cutoff {
+				item := p.liveHeap.PopItem()
+				if err := p.ingestSortedCCM44Tick(item.tick, false); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		// Historical replay mode: globally sorted stream across all symbols
+		if ts > p.maxSIPTimestampNS {
+			p.maxSIPTimestampNS = ts
+		}
+		return p.ingestSortedCCM44Tick(tick, true)
+	}
+
+	// 1. Initialize phase start anchors on first tick (5-feature legacy mode)
+	for pIdx, pCfg := range p.phases {
+		if p.phaseNextAnchor[pIdx] == 0 {
+			offsetNS := int64(pCfg.OffsetMS) * 1_000_000
+			firstAnchor := ((ts-offsetNS)/p.cadenceNS)*p.cadenceNS + offsetNS
+			if firstAnchor <= ts {
+				firstAnchor += p.cadenceNS
+			}
+			p.phaseNextAnchor[pIdx] = firstAnchor
+		}
 	}
 
 	// 2. Check if any phase has completed its window (5-feature legacy mode)
@@ -574,15 +743,17 @@ func (p *Projector) updateSnapshot(uIdx int, tick feed.Tick) {
 		return
 	}
 	snap := &p.snapshots[uIdx]
-	snap.SIPTimestampNS = tick.SIPTimestampNS
-	snap.RecvTimestampNS = tick.SIPTimestampNS
+	if tick.SIPTimestampNS > snap.SIPTimestampNS {
+		snap.SIPTimestampNS = tick.SIPTimestampNS
+		snap.RecvTimestampNS = tick.SIPTimestampNS
+	}
 
 	mt := &p.microTrackers[uIdx]
 	if tick.Type == feed.TickTrade {
 		snap.LastTradePx = tick.Price
 		snap.LastTradeSz = tick.Size
 		snap.Conditions++
-		mt.OnTrade(tick.SIPTimestampNS, tick.Price, tick.Size)
+		mt.OnTradeWithExch(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch)
 	} else {
 		snap.BidPx = tick.BidPx
 		snap.AskPx = tick.AskPx
@@ -592,18 +763,29 @@ func (p *Projector) updateSnapshot(uIdx int, tick feed.Tick) {
 			snap.Midprice = (tick.BidPx + tick.AskPx) / 2.0
 			snap.Spread = tick.AskPx - tick.BidPx
 		}
-		mt.OnQuote(tick.SIPTimestampNS, tick.BidPx, tick.AskPx)
+		mt.OnQuoteWithExch(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidExch)
 	}
 
 	p.producer.WriteSnapshot(uIdx, snap)
-	micro := &p.microSnapshots[uIdx]
-	mt.ComputeSnapshot(tick.SIPTimestampNS, micro)
-	p.producer.WriteMicroSnapshot(uIdx, micro)
+	if p.isLiveMode {
+		micro := &p.microSnapshots[uIdx]
+		mt.ComputeSnapshot(snap.SIPTimestampNS, micro)
+		p.producer.WriteMicroSnapshot(uIdx, micro)
+	}
 }
 
 // Flush closes remaining bars up to targetEndNS.
 func (p *Projector) Flush(targetEndNS int64) error {
 	if p.isCCM44 {
+		if p.isLiveMode {
+			for p.liveHeap.Len() > 0 && p.liveHeap.PeekItem().tick.SIPTimestampNS <= targetEndNS {
+				item := p.liveHeap.PopItem()
+				if err := p.ingestSortedCCM44Tick(item.tick, false); err != nil {
+					return err
+				}
+			}
+		}
+
 		for {
 			earliestPIdx := -1
 			var earliestPhaseAnchor int64 = 0
@@ -646,12 +828,16 @@ func (p *Projector) Flush(targetEndNS int64) error {
 			}
 		}
 	}
-	if targetEndNS > 0 {
+	snapTS := targetEndNS
+	if p.maxSIPTimestampNS > snapTS {
+		snapTS = p.maxSIPTimestampNS
+	}
+	if snapTS > 0 {
 		for uIdx := range p.microTrackers {
 			mt := &p.microTrackers[uIdx]
 			if mt.initialized {
 				micro := &p.microSnapshots[uIdx]
-				mt.ComputeSnapshot(targetEndNS, micro)
+				mt.ComputeSnapshot(snapTS, micro)
 				p.producer.WriteMicroSnapshot(uIdx, micro)
 			}
 		}
