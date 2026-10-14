@@ -9,19 +9,25 @@ import (
 )
 
 type parquetTradeRow struct {
-	Ticker       string  `parquet:"ticker"`
-	SIPTimestamp int64   `parquet:"sip_timestamp"`
-	Price        float64 `parquet:"price"`
-	Size         float64 `parquet:"size"`
+	Ticker        string   `parquet:"ticker"`
+	SIPTimestamp  int64    `parquet:"sip_timestamp"`
+	ParticipantTS int64    `parquet:"participant_timestamp,optional"`
+	Price         float64  `parquet:"price"`
+	Size          float64  `parquet:"size"`
+	Exchange      int32    `parquet:"exchange,optional"`
+	TrfID         *float64 `parquet:"trf_id,optional"`
 }
 
 type parquetQuoteRow struct {
-	Ticker       string  `parquet:"ticker"`
-	SIPTimestamp int64   `parquet:"sip_timestamp"`
-	BidPrice     float64 `parquet:"bid_price"`
-	BidSize      float64 `parquet:"bid_size"`
-	AskPrice     float64 `parquet:"ask_price"`
-	AskSize      float64 `parquet:"ask_size"`
+	Ticker        string  `parquet:"ticker"`
+	SIPTimestamp  int64   `parquet:"sip_timestamp"`
+	ParticipantTS int64   `parquet:"participant_timestamp,optional"`
+	BidPrice      float64 `parquet:"bid_price"`
+	BidSize       float64 `parquet:"bid_size"`
+	AskPrice      float64 `parquet:"ask_price"`
+	AskSize       float64 `parquet:"ask_size"`
+	BidExchange   int32   `parquet:"bid_exchange,optional"`
+	AskExchange   int32   `parquet:"ask_exchange,optional"`
 }
 
 // ParquetTradeReader reads trade ticks from a Parquet file.
@@ -81,12 +87,21 @@ func (r *ParquetTradeReader) Next() bool {
 		sym = row.Ticker
 	}
 
+	partNS := row.ParticipantTS
+	if partNS <= 0 {
+		partNS = row.SIPTimestamp
+	}
+	isDark := row.TrfID != nil && *row.TrfID > 0
+
 	r.current = Tick{
-		SIPTimestampNS: row.SIPTimestamp,
-		Symbol:         sym,
-		Type:           TickTrade,
-		Price:          row.Price,
-		Size:           row.Size,
+		SIPTimestampNS:         row.SIPTimestamp,
+		ParticipantTimestampNS: partNS,
+		Symbol:                 sym,
+		Type:                   TickTrade,
+		IsDark:                 isDark,
+		Price:                  row.Price,
+		Size:                   row.Size,
+		TradeExch:              int16(row.Exchange),
 	}
 	return true
 }
@@ -183,15 +198,23 @@ func (r *ParquetQuoteReader) Next() bool {
 		mid = row.AskPrice
 	}
 
+	partNS := row.ParticipantTS
+	if partNS <= 0 {
+		partNS = row.SIPTimestamp
+	}
+
 	r.current = Tick{
-		SIPTimestampNS: row.SIPTimestamp,
-		Symbol:         sym,
-		Type:           TickQuote,
-		Price:          mid,
-		BidPx:          row.BidPrice,
-		AskPx:          row.AskPrice,
-		BidSz:          row.BidSize,
-		AskSz:          row.AskSize,
+		SIPTimestampNS:         row.SIPTimestamp,
+		ParticipantTimestampNS: partNS,
+		Symbol:                 sym,
+		Type:                   TickQuote,
+		Price:                  mid,
+		BidPx:                  row.BidPrice,
+		AskPx:                  row.AskPrice,
+		BidSz:                  row.BidSize,
+		AskSz:                  row.AskSize,
+		BidExch:                int16(row.BidExchange),
+		AskExch:                int16(row.AskExchange),
 	}
 	return true
 }

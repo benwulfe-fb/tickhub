@@ -62,12 +62,17 @@ type RawMassiveEvent struct {
 	Ap float64 `json:"ap,omitempty"`
 	Bs float64 `json:"bs,omitempty"`
 	As float64 `json:"as,omitempty"`
+	Bx int16   `json:"bx,omitempty"`
+	Ax int16   `json:"ax,omitempty"`
+	X  int16   `json:"x,omitempty"`
 	// Trade fields
-	P  float64     `json:"p,omitempty"`
-	S  float64     `json:"s,omitempty"`
-	Ds FlexFloat64 `json:"ds,omitempty"`
-	// Timestamp in SIP milliseconds
-	T int64 `json:"t,omitempty"`
+	P    float64     `json:"p,omitempty"`
+	S    float64     `json:"s,omitempty"`
+	Ds   FlexFloat64 `json:"ds,omitempty"`
+	Trfi float64     `json:"trfi,omitempty"`
+	// Timestamps in SIP / Participant milliseconds
+	T  int64 `json:"t,omitempty"`
+	Pt int64 `json:"pt,omitempty"`
 }
 
 // FormatSubscription formats explicit Q.<sym>,T.<sym> subscription string.
@@ -112,14 +117,22 @@ func ParseMassiveEvents(data []byte) ([]Tick, error) {
 	for _, ev := range events {
 		switch ev.Ev {
 		case "Q":
+			sipNS := ev.T * NSPerMS
+			partNS := sipNS
+			if ev.Pt > 0 {
+				partNS = ev.Pt * NSPerMS
+			}
 			ticks = append(ticks, Tick{
-				SIPTimestampNS: ev.T * NSPerMS,
-				Symbol:         ev.Sym,
-				Type:           TickQuote,
-				BidPx:          ev.Bp,
-				AskPx:          ev.Ap,
-				BidSz:          ev.Bs,
-				AskSz:          ev.As,
+				SIPTimestampNS:         sipNS,
+				ParticipantTimestampNS: partNS,
+				Symbol:                 ev.Sym,
+				Type:                   TickQuote,
+				BidPx:                  ev.Bp,
+				AskPx:                  ev.Ap,
+				BidSz:                  ev.Bs,
+				AskSz:                  ev.As,
+				BidExch:                ev.Bx,
+				AskExch:                ev.Ax,
 			})
 		case "T":
 			sz := ev.Ds.Float64()
@@ -129,12 +142,20 @@ func ParseMassiveEvents(data []byte) ([]Tick, error) {
 			if ev.P <= 0 || sz <= 0 || ev.T <= 0 {
 				continue
 			}
+			sipNS := ev.T * NSPerMS
+			partNS := sipNS
+			if ev.Pt > 0 {
+				partNS = ev.Pt * NSPerMS
+			}
 			ticks = append(ticks, Tick{
-				SIPTimestampNS: ev.T * NSPerMS,
-				Symbol:         ev.Sym,
-				Type:           TickTrade,
-				Price:          ev.P,
-				Size:           sz,
+				SIPTimestampNS:         sipNS,
+				ParticipantTimestampNS: partNS,
+				Symbol:                 ev.Sym,
+				Type:                   TickTrade,
+				IsDark:                 ev.Trfi > 0,
+				Price:                  ev.P,
+				Size:                   sz,
+				TradeExch:              ev.X,
 			})
 		case "status":
 			log.Printf("[MASSIVE-WS] Status event: status=%s message=%s", ev.Status, ev.Msg)

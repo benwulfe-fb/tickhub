@@ -2,6 +2,7 @@ package project
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/benwulfe-fb/tickhub/pkg/feed"
@@ -16,11 +17,23 @@ type Projector struct {
 	uniqueSymbols []string
 	symToUnique   map[string]int
 
-	// Per-phase symbol histories: [phaseIdx][symbolPhaseIdx]
+	// Per-phase symbol histories: [phaseIdx][symbolPhaseIdx] (5-feature legacy mode)
 	histories [][]*SymbolHistory
 
 	// Mapping: symbol -> []PhaseRef{phaseIdx, symbolPhaseIdx}
 	symbolPhaseRefs map[string][]phaseRef
+
+	// CCM 44-slot mode state (one SymbolHistory per unique symbol)
+	isCCM44            bool
+	isLiveMode         bool
+	nextSecondAnchorNS int64
+	symNextSecondNS    []int64
+	uniqueHistories    []*SymbolHistory
+	uniqueLastCCMBar   [][44]float64
+	symBarRing         [][4][44]float64
+	symBarAnchor       [][4]int64
+	phaseAsOf          [][][8]float64
+	phaseAsOfCaptured  [][]bool
 
 	// Current target anchor per phase
 	phaseNextAnchor []int64
@@ -59,6 +72,17 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 	histories := make([][]*SymbolHistory, len(phases))
 	symbolPhaseRefs := make(map[string][]phaseRef)
 
+	isCCM44 := false
+	isLiveMode := false
+	if producer != nil && producer.Header() != nil {
+		if producer.Header().Mode == shm.ModeLiveStreaming {
+			isLiveMode = true
+		}
+		if len(producer.Header().Phases) > 0 && int(producer.Header().Phases[0].NumFeatures) == 44 {
+			isCCM44 = true
+		}
+	}
+
 	phaseFeatBuffers := make([][]float64, len(phases))
 	for pIdx, p := range phases {
 		histories[pIdx] = make([]*SymbolHistory, len(p.Symbols))
@@ -79,22 +103,73 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 		}
 	}
 
-	return &Projector{
-		producer:         producer,
-		cadenceNS:        cadenceNS,
-		phases:           phases,
-		uniqueSymbols:    uniqueSymbols,
-		symToUnique:      symToUnique,
-		histories:        histories,
-		symbolPhaseRefs:  symbolPhaseRefs,
-		phaseNextAnchor:  make([]int64, len(phases)),
-		phaseSlots:       make([]int, len(phases)),
-		featBuffer:       make([]float64, 5),
-		phaseFeatBuffers: phaseFeatBuffers,
-		snapshots:        make([]shm.SymbolSnapshot, len(uniqueSymbols)),
-		microTrackers:    make([]MicroTracker, len(uniqueSymbols)),
-		microSnapshots:   make([]shm.SymbolMicroSnapshot, len(uniqueSymbols)),
+	var uniqueHistories []*SymbolHistory
+	var uniqueLastCCMBar [][44]float64
+	var symBarRing [][4][44]float64
+	var symBarAnchor [][4]int64
+	var symNextSecondNS []int64
+	var phaseAsOf [][][8]float64
+	var phaseAsOfCaptured [][]bool
+
+	if isCCM44 {
+		nan := math.NaN()
+		uniqueHistories = make([]*SymbolHistory, len(uniqueSymbols))
+		uniqueLastCCMBar = make([][44]float64, len(uniqueSymbols))
+		symBarRing = make([][4][44]float64, len(uniqueSymbols))
+		symBarAnchor = make([][4]int64, len(uniqueSymbols))
+		symNextSecondNS = make([]int64, len(uniqueSymbols))
+		for i := range uniqueSymbols {
+			h := &SymbolHistory{}
+			h.InitCCM44()
+			uniqueHistories[i] = h
+			for k := 14; k <= 29; k++ {
+				uniqueLastCCMBar[i][k] = nan
+			}
+			for k := 30; k <= 33; k++ {
+				uniqueLastCCMBar[i][k] = -1.0
+			}
+			for k := 36; k <= 41; k++ {
+				uniqueLastCCMBar[i][k] = nan
+			}
+		}
+		phaseAsOf = make([][][8]float64, len(phases))
+		phaseAsOfCaptured = make([][]bool, len(phases))
+		for pIdx := range phases {
+			phaseAsOf[pIdx] = make([][8]float64, len(uniqueSymbols))
+			phaseAsOfCaptured[pIdx] = make([]bool, len(uniqueSymbols))
+		}
 	}
+
+	return &Projector{
+		producer:          producer,
+		cadenceNS:         cadenceNS,
+		phases:            phases,
+		uniqueSymbols:     uniqueSymbols,
+		symToUnique:       symToUnique,
+		histories:         histories,
+		symbolPhaseRefs:   symbolPhaseRefs,
+		isCCM44:           isCCM44,
+		isLiveMode:        isLiveMode,
+		symNextSecondNS:   symNextSecondNS,
+		uniqueHistories:   uniqueHistories,
+		uniqueLastCCMBar:  uniqueLastCCMBar,
+		symBarRing:        symBarRing,
+		symBarAnchor:      symBarAnchor,
+		phaseAsOf:         phaseAsOf,
+		phaseAsOfCaptured: phaseAsOfCaptured,
+		phaseNextAnchor:   make([]int64, len(phases)),
+		phaseSlots:        make([]int, len(phases)),
+		featBuffer:        make([]float64, 5),
+		phaseFeatBuffers:  phaseFeatBuffers,
+		snapshots:         make([]shm.SymbolSnapshot, len(uniqueSymbols)),
+		microTrackers:     make([]MicroTracker, len(uniqueSymbols)),
+		microSnapshots:    make([]shm.SymbolMicroSnapshot, len(uniqueSymbols)),
+	}
+}
+
+// IsCCM44 returns true when the projector is configured with the 44-slot CCM 1Hz schema.
+func (p *Projector) IsCCM44() bool {
+	return p.isCCM44
 }
 
 // SetStartAnchor sets the initial window start anchor across all phases.
@@ -106,6 +181,16 @@ func (p *Projector) SetStartAnchor(startNS int64) {
 			firstAnchor += p.cadenceNS
 		}
 		p.phaseNextAnchor[pIdx] = firstAnchor
+	}
+	if p.isCCM44 {
+		secAnchor := (startNS / p.cadenceNS) * p.cadenceNS
+		if secAnchor <= startNS {
+			secAnchor += p.cadenceNS
+		}
+		p.nextSecondAnchorNS = secAnchor
+		for uIdx := range p.symNextSecondNS {
+			p.symNextSecondNS[uIdx] = secAnchor
+		}
 	}
 }
 
@@ -212,6 +297,39 @@ func (p *Projector) SeedPrevailingPrice(symbol string, lastPx, lastBid, lastAsk 
 	}
 }
 
+// IngestPreWindowTick advances cumulative Lee-Ready, venue quote, and top-of-book state for ticks prior to startNS.
+func (p *Projector) IngestPreWindowTick(tick feed.Tick) {
+	uIdx, ok := p.symToUnique[tick.Symbol]
+	if !ok {
+		return
+	}
+	p.updateSnapshot(uIdx, tick)
+	if p.isCCM44 {
+		hist := p.uniqueHistories[uIdx]
+		if tick.Type == feed.TickTrade {
+			hist.IngestPreWindowCCMTrade(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch)
+		} else {
+			hist.IngestPreWindowCCMQuote(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz, tick.BidExch, tick.AskExch)
+		}
+	}
+}
+
+func (p *Projector) closeSymbolSecondBar(uIdx int, secAnchorNS int64) {
+	hist := p.uniqueHistories[uIdx]
+	hist.CloseCCMBar(secAnchorNS, &p.uniqueLastCCMBar[uIdx])
+	slot := int((secAnchorNS / p.cadenceNS) & 3)
+	p.symBarRing[uIdx][slot] = p.uniqueLastCCMBar[uIdx]
+	p.symBarAnchor[uIdx][slot] = secAnchorNS
+	p.symNextSecondNS[uIdx] = secAnchorNS + p.cadenceNS
+}
+
+func (p *Projector) closeSecondBar(secAnchorNS int64) {
+	for uIdx := range p.uniqueHistories {
+		for p.symNextSecondNS[uIdx] <= secAnchorNS {
+			p.closeSymbolSecondBar(uIdx, p.symNextSecondNS[uIdx])
+		}
+	}
+}
 
 // IngestTick processes a market tick and commits completed 1Hz frames when time boundaries are crossed.
 func (p *Projector) IngestTick(tick feed.Tick) error {
@@ -228,8 +346,101 @@ func (p *Projector) IngestTick(tick feed.Tick) error {
 			p.phaseNextAnchor[pIdx] = firstAnchor
 		}
 	}
+	if p.isCCM44 && p.nextSecondAnchorNS == 0 {
+		secAnchor := (ts / p.cadenceNS) * p.cadenceNS
+		if secAnchor <= ts {
+			secAnchor += p.cadenceNS
+		}
+		p.nextSecondAnchorNS = secAnchor
+		for uIdx := range p.symNextSecondNS {
+			p.symNextSecondNS[uIdx] = secAnchor
+		}
+	}
 
-	// 2. Check if any phase has completed its window
+	if p.isCCM44 {
+		if p.isLiveMode {
+			earliestTarget := p.nextSecondAnchorNS
+			for pIdx := range p.phases {
+				t := p.phaseNextAnchor[pIdx]
+				if t > 0 && (earliestTarget == 0 || t < earliestTarget) {
+					earliestTarget = t
+				}
+			}
+			if earliestTarget > 0 && ts >= earliestTarget+p.cadenceNS {
+				if err := p.Flush(ts - p.cadenceNS); err != nil {
+					return err
+				}
+			}
+			if uIdx, ok := p.symToUnique[tick.Symbol]; ok {
+				hist := p.uniqueHistories[uIdx]
+				for pIdx := range p.phases {
+					if !p.phaseAsOfCaptured[pIdx][uIdx] && ts > p.phaseNextAnchor[pIdx] {
+						var tmp [44]float64
+						hist.WriteCCMTerminalState(&tmp)
+						copy(p.phaseAsOf[pIdx][uIdx][:], tmp[36:44])
+						p.phaseAsOfCaptured[pIdx][uIdx] = true
+					}
+				}
+				for p.symNextSecondNS[uIdx] <= ts {
+					p.closeSymbolSecondBar(uIdx, p.symNextSecondNS[uIdx])
+				}
+				p.updateSnapshot(uIdx, tick)
+				if tick.Type == feed.TickTrade {
+					hist.IngestCCMTrade(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch, tick.IsDark)
+				} else {
+					hist.IngestCCMQuote(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz, tick.BidExch, tick.AskExch)
+				}
+			}
+			return nil
+		}
+
+		// Historical replay mode: globally sorted stream across all symbols
+		for {
+			earliestPIdx := -1
+			var earliestPhaseAnchor int64 = 0
+			for pIdx := range p.phases {
+				target := p.phaseNextAnchor[pIdx]
+				// Terminal as-of state includes ticks with ts <= target (side='right')
+				if ts > target {
+					if earliestPhaseAnchor == 0 || target < earliestPhaseAnchor {
+						earliestPhaseAnchor = target
+						earliestPIdx = pIdx
+					}
+				}
+			}
+
+			// Whole-second bar [secAnchor - 1s, secAnchor) includes ticks with ts < secAnchor (side='left')
+			secReady := p.nextSecondAnchorNS > 0 && ts >= p.nextSecondAnchorNS
+			if secReady && (earliestPIdx < 0 || p.nextSecondAnchorNS <= earliestPhaseAnchor) {
+				p.closeSecondBar(p.nextSecondAnchorNS)
+				p.nextSecondAnchorNS += p.cadenceNS
+				continue
+			}
+
+			if earliestPIdx < 0 {
+				break
+			}
+
+			if err := p.closePhase(earliestPIdx, earliestPhaseAnchor); err != nil {
+				return err
+			}
+			p.phaseNextAnchor[earliestPIdx] += p.cadenceNS
+			p.phaseSlots[earliestPIdx]++
+		}
+
+		if uIdx, ok := p.symToUnique[tick.Symbol]; ok {
+			p.updateSnapshot(uIdx, tick)
+			hist := p.uniqueHistories[uIdx]
+			if tick.Type == feed.TickTrade {
+				hist.IngestCCMTrade(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch, tick.IsDark)
+			} else {
+				hist.IngestCCMQuote(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz, tick.BidExch, tick.AskExch)
+			}
+		}
+		return nil
+	}
+
+	// 2. Check if any phase has completed its window (5-feature legacy mode)
 	for {
 		earliestPIdx := -1
 		var earliestAnchor int64 = 0
@@ -281,16 +492,43 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 	slot := p.phaseSlots[pIdx]
 	featBuf := p.phaseFeatBuffers[pIdx]
 
-	for sIdx := range pCfg.Symbols {
-		hist := p.histories[pIdx][sIdx]
-		r1, r5, r15, v1, sp := hist.CloseBar(slot)
+	if p.isCCM44 {
+		anchorFloorNS := (anchorNS / p.cadenceNS) * p.cadenceNS
+		barSlot := int((anchorFloorNS / p.cadenceNS) & 3)
+		for sIdx, sym := range pCfg.Symbols {
+			uIdx, ok := p.symToUnique[sym]
+			if !ok {
+				continue
+			}
+			for p.symNextSecondNS[uIdx] <= anchorFloorNS {
+				p.closeSymbolSecondBar(uIdx, p.symNextSecondNS[uIdx])
+			}
+			base := sIdx * 44
+			if p.symBarAnchor[uIdx][barSlot] == anchorFloorNS {
+				copy(featBuf[base:base+36], p.symBarRing[uIdx][barSlot][0:36])
+			} else {
+				copy(featBuf[base:base+36], p.uniqueLastCCMBar[uIdx][0:36])
+			}
+			if p.phaseAsOfCaptured[pIdx][uIdx] {
+				copy(featBuf[base+36:base+44], p.phaseAsOf[pIdx][uIdx][:])
+				p.phaseAsOfCaptured[pIdx][uIdx] = false
+			} else {
+				p.uniqueHistories[uIdx].WriteCCMTerminalState(&p.uniqueLastCCMBar[uIdx])
+				copy(featBuf[base+36:base+44], p.uniqueLastCCMBar[uIdx][36:44])
+			}
+		}
+	} else {
+		for sIdx := range pCfg.Symbols {
+			hist := p.histories[pIdx][sIdx]
+			r1, r5, r15, v1, sp := hist.CloseBar(slot)
 
-		base := sIdx * 5
-		featBuf[base] = r1
-		featBuf[base+1] = r5
-		featBuf[base+2] = r15
-		featBuf[base+3] = v1
-		featBuf[base+4] = sp
+			base := sIdx * 5
+			featBuf[base] = r1
+			featBuf[base+1] = r5
+			featBuf[base+2] = r15
+			featBuf[base+3] = v1
+			featBuf[base+4] = sp
+		}
 	}
 
 	if err := p.producer.CommitPhaseFrame(pIdx, anchorNS, featBuf); err != nil {
@@ -349,14 +587,47 @@ func (p *Projector) updateSnapshot(uIdx int, tick feed.Tick) {
 
 // Flush closes remaining bars up to targetEndNS.
 func (p *Projector) Flush(targetEndNS int64) error {
-	for pIdx := range p.phases {
-		for p.phaseNextAnchor[pIdx] <= targetEndNS {
-			anchor := p.phaseNextAnchor[pIdx]
-			if err := p.closePhase(pIdx, anchor); err != nil {
+	if p.isCCM44 {
+		for {
+			earliestPIdx := -1
+			var earliestPhaseAnchor int64 = 0
+			for pIdx := range p.phases {
+				target := p.phaseNextAnchor[pIdx]
+				if target > 0 && target <= targetEndNS {
+					if earliestPhaseAnchor == 0 || target < earliestPhaseAnchor {
+						earliestPhaseAnchor = target
+						earliestPIdx = pIdx
+					}
+				}
+			}
+
+			secReady := p.nextSecondAnchorNS > 0 && p.nextSecondAnchorNS <= targetEndNS
+			if secReady && (earliestPIdx < 0 || p.nextSecondAnchorNS <= earliestPhaseAnchor) {
+				p.closeSecondBar(p.nextSecondAnchorNS)
+				p.nextSecondAnchorNS += p.cadenceNS
+				continue
+			}
+
+			if earliestPIdx < 0 {
+				break
+			}
+
+			if err := p.closePhase(earliestPIdx, earliestPhaseAnchor); err != nil {
 				return err
 			}
-			p.phaseNextAnchor[pIdx] += p.cadenceNS
-			p.phaseSlots[pIdx]++
+			p.phaseNextAnchor[earliestPIdx] += p.cadenceNS
+			p.phaseSlots[earliestPIdx]++
+		}
+	} else {
+		for pIdx := range p.phases {
+			for p.phaseNextAnchor[pIdx] <= targetEndNS {
+				anchor := p.phaseNextAnchor[pIdx]
+				if err := p.closePhase(pIdx, anchor); err != nil {
+					return err
+				}
+				p.phaseNextAnchor[pIdx] += p.cadenceNS
+				p.phaseSlots[pIdx]++
+			}
 		}
 	}
 	if targetEndNS > 0 {
@@ -381,3 +652,4 @@ func (p *Projector) CommittedFrames() int {
 func (p *Projector) AnchorRange() (int64, int64) {
 	return p.firstCommittedAnchor, p.lastCommittedAnchor
 }
+

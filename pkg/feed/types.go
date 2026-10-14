@@ -20,15 +20,20 @@ func (t TickType) String() string {
 
 // Tick represents a normalized market tick (either a trade or a quote).
 type Tick struct {
-	SIPTimestampNS int64
-	Symbol         string
-	Type           TickType
-	Price          float64
-	Size           float64
-	BidPx          float64
-	AskPx          float64
-	BidSz          float64
-	AskSz          float64
+	SIPTimestampNS         int64
+	ParticipantTimestampNS int64
+	Symbol                 string
+	Type                   TickType
+	IsDark                 bool
+	BidExch                int16
+	AskExch                int16
+	TradeExch              int16
+	Price                  float64
+	Size                   float64
+	BidPx                  float64
+	AskPx                  float64
+	BidSz                  float64
+	AskSz                  float64
 }
 
 // TickReader is an iterator over a chronological stream of Ticks.

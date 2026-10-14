@@ -217,6 +217,9 @@ func serviceChunk(
 		ts := tick.SIPTimestampNS
 
 		if ts < startNS {
+			if projector.IsCCM44() {
+				projector.IngestPreWindowTick(tick)
+			}
 			if tick.Type == feed.TickQuote {
 				if tick.BidPx > 0 {
 					lastBid = tick.BidPx
@@ -237,11 +240,15 @@ func serviceChunk(
 		// First tick at or after startNS
 		hasWindowTicks = true
 
-		if hasPreQuote || hasPreTrade {
+		if !projector.IsCCM44() && (hasPreQuote || hasPreTrade) {
 			projector.SeedState(sym, lastBid, lastAsk, lastPrice)
 		}
 
-		if ts < endNS {
+		inWindow := ts < endNS
+		if projector.IsCCM44() {
+			inWindow = ts <= endNS
+		}
+		if inWindow {
 			if err := projector.IngestTick(tick); err != nil {
 				return 0, 0, 0, 0, fmt.Errorf("ingest tick @ %d: %w", ts, err)
 			}
@@ -253,7 +260,7 @@ func serviceChunk(
 				return 0, 0, 0, 0, fmt.Errorf("chunk replay timeout (5s): %w", err)
 			}
 			t := merger.Tick()
-			if t.SIPTimestampNS >= endNS {
+			if (!projector.IsCCM44() && t.SIPTimestampNS >= endNS) || (projector.IsCCM44() && t.SIPTimestampNS > endNS) {
 				break
 			}
 			if err := projector.IngestTick(t); err != nil {
@@ -270,7 +277,7 @@ func serviceChunk(
 
 	if !hasWindowTicks {
 		// No ticks at or after startNS; forward fill empty bars
-		if hasPreQuote || hasPreTrade {
+		if !projector.IsCCM44() && (hasPreQuote || hasPreTrade) {
 			projector.SeedState(sym, lastBid, lastAsk, lastPrice)
 		}
 		if err := projector.Flush(endNS); err != nil {
