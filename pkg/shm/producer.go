@@ -526,7 +526,6 @@ func (p *Producer) CommitSymbolMetrics(phaseIdx int, symbolPhaseIdx int, anchorN
 	nSym := uintptr(p.header.Phases[phaseIdx].NumSymbols)
 	nFeat := uintptr(p.header.Phases[phaseIdx].NumFeatures)
 
-	// Offsets:
 	// FrameHeader: 64 bytes
 	// SymbolAnchors: 64 + symbolPhaseIdx * 8
 	// Features: 64 + nSym*8 + symbolPhaseIdx * nFeat * 8
@@ -622,9 +621,10 @@ func (p *Producer) CommitFrameFinalize(anchorNS int64) {
 // Resetting FirstAnchorNS and LastReadAnchorNS allows WaitConsumerAdvance
 // to permit unthrottled burst writing for the upcoming chunk window.
 func (p *Producer) ResetAnchors(firstAnchorNS int64) {
-	atomic.StoreInt64(&p.header.FirstAnchorNS, firstAnchorNS)
+	if atomic.LoadInt64(&p.header.FirstAnchorNS) == 0 || firstAnchorNS < atomic.LoadInt64(&p.header.FirstAnchorNS) {
+		atomic.StoreInt64(&p.header.FirstAnchorNS, firstAnchorNS)
+	}
 	atomic.StoreInt64(&p.firstAnchorNS, firstAnchorNS)
-	atomic.StoreInt64(&p.header.LastWrittenAnchorNS, 0)
 	atomic.StoreInt64(&p.header.LastReadAnchorNS, 0)
 }
 

@@ -130,7 +130,6 @@ type Projector struct {
 	lastCommittedAnchor    int64
 	totalCommittedFrames   int
 	coldStartBarsRemaining int
-
 	// Watermark reorder buffer and stream-time state (CCM 44 live mode)
 	watermarkBufferNS int64
 	maxSIPTimestampNS int64
@@ -139,6 +138,7 @@ type Projector struct {
 	lateDroppedTicks  uint64
 	warnedLateDrop    bool
 	liveHeap          tickMinHeap
+	targetSymbol      string
 }
 
 type phaseRef struct {
@@ -303,6 +303,11 @@ func (p *Projector) VirtualStreamNow(now time.Time) int64 {
 	return p.maxSIPTimestampNS + elapsed
 }
 
+// SetTargetSymbol restricts projection and frame commits to a single symbol (e.g. on-demand worker chunk replay).
+func (p *Projector) SetTargetSymbol(sym string) {
+	p.targetSymbol = sym
+}
+
 // SetStartAnchor sets the initial window start anchor across all phases.
 func (p *Projector) SetStartAnchor(startNS int64) {
 	for pIdx, pCfg := range p.phases {
@@ -461,6 +466,14 @@ func (p *Projector) closeSymbolSecondBar(uIdx int, secAnchorNS int64) {
 }
 
 func (p *Projector) closeSecondBar(secAnchorNS int64) {
+	if p.targetSymbol != "" {
+		if uIdx, ok := p.symToUnique[p.targetSymbol]; ok {
+			for p.symNextSecondNS[uIdx] <= secAnchorNS {
+				p.closeSymbolSecondBar(uIdx, p.symNextSecondNS[uIdx])
+			}
+		}
+		return
+	}
 	for uIdx := range p.uniqueHistories {
 		for p.symNextSecondNS[uIdx] <= secAnchorNS {
 			p.closeSymbolSecondBar(uIdx, p.symNextSecondNS[uIdx])
@@ -681,6 +694,9 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 		anchorFloorNS := (anchorNS / p.cadenceNS) * p.cadenceNS
 		barSlot := int((anchorFloorNS / p.cadenceNS) & 3)
 		for sIdx, sym := range pCfg.Symbols {
+			if p.targetSymbol != "" && sym != p.targetSymbol {
+				continue
+			}
 			uIdx, ok := p.symToUnique[sym]
 			if !ok {
 				continue
@@ -701,9 +717,17 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 				p.uniqueHistories[uIdx].WriteCCMTerminalState(&p.uniqueLastCCMBar[uIdx])
 				copy(featBuf[base+36:base+44], p.uniqueLastCCMBar[uIdx][36:44])
 			}
+			if p.targetSymbol != "" {
+				if err := p.producer.CommitSymbolMetrics(pIdx, sIdx, anchorNS, featBuf[base:base+44]); err != nil {
+					return fmt.Errorf("commit symbol frame p%d s%d @ %d: %w", pIdx, sIdx, anchorNS, err)
+				}
+			}
 		}
 	} else {
-		for sIdx := range pCfg.Symbols {
+		for sIdx, sym := range pCfg.Symbols {
+			if p.targetSymbol != "" && sym != p.targetSymbol {
+				continue
+			}
 			hist := p.histories[pIdx][sIdx]
 			r1, r5, r15, v1, sp := hist.CloseBar(slot)
 
@@ -713,11 +737,18 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 			featBuf[base+2] = r15
 			featBuf[base+3] = v1
 			featBuf[base+4] = sp
+			if p.targetSymbol != "" {
+				if err := p.producer.CommitSymbolMetrics(pIdx, sIdx, anchorNS, featBuf[base:base+5]); err != nil {
+					return fmt.Errorf("commit symbol frame p%d s%d @ %d: %w", pIdx, sIdx, anchorNS, err)
+				}
+			}
 		}
 	}
 
-	if err := p.producer.CommitPhaseFrame(pIdx, anchorNS, featBuf); err != nil {
-		return fmt.Errorf("commit phase frame p%d @ %d: %w", pIdx, anchorNS, err)
+	if p.targetSymbol == "" {
+		if err := p.producer.CommitPhaseFrame(pIdx, anchorNS, featBuf); err != nil {
+			return fmt.Errorf("commit phase frame p%d @ %d: %w", pIdx, anchorNS, err)
+		}
 	}
 
 	if p.coldStartBarsRemaining > 0 {
@@ -833,12 +864,23 @@ func (p *Projector) Flush(targetEndNS int64) error {
 		snapTS = p.maxSIPTimestampNS
 	}
 	if snapTS > 0 {
-		for uIdx := range p.microTrackers {
-			mt := &p.microTrackers[uIdx]
-			if mt.initialized {
-				micro := &p.microSnapshots[uIdx]
-				mt.ComputeSnapshot(snapTS, micro)
-				p.producer.WriteMicroSnapshot(uIdx, micro)
+		if p.targetSymbol != "" {
+			if uIdx, ok := p.symToUnique[p.targetSymbol]; ok {
+				mt := &p.microTrackers[uIdx]
+				if mt.initialized {
+					micro := &p.microSnapshots[uIdx]
+					mt.ComputeSnapshot(snapTS, micro)
+					p.producer.WriteMicroSnapshot(uIdx, micro)
+				}
+			}
+		} else {
+			for uIdx := range p.microTrackers {
+				mt := &p.microTrackers[uIdx]
+				if mt.initialized {
+					micro := &p.microSnapshots[uIdx]
+					mt.ComputeSnapshot(snapTS, micro)
+					p.producer.WriteMicroSnapshot(uIdx, micro)
+				}
 			}
 		}
 	}

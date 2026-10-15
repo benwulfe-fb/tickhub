@@ -142,6 +142,12 @@ func runWorker(args []string) {
 				atomic.StoreUint32(&header.ControlResp.ColdStartFrames, uint32(coldStart))
 				atomic.StoreInt64(&header.ControlResp.FirstAnchorNS, firstAnchor)
 				atomic.StoreInt64(&header.ControlResp.LastAnchorNS, lastAnchor)
+				if atomic.LoadInt64(&header.FirstAnchorNS) == 0 || (firstAnchor > 0 && firstAnchor < atomic.LoadInt64(&header.FirstAnchorNS)) {
+					atomic.StoreInt64(&header.FirstAnchorNS, firstAnchor)
+				}
+				if lastAnchor > atomic.LoadInt64(&header.LastWrittenAnchorNS) {
+					atomic.StoreInt64(&header.LastWrittenAnchorNS, lastAnchor)
+				}
 				atomic.StoreUint32(&header.ControlResp.Status, shm.ControlStatusReady)
 				atomic.StoreUint64(&header.ControlResp.ResponseID, reqID)
 			}
@@ -199,6 +205,7 @@ func serviceChunk(
 	prod.ResetAnchors(startNS + cadenceNS)
 
 	projector := project.NewProjector(prod, phases, rawCfg.UniqueSymbols, cadence)
+	projector.SetTargetSymbol(sym)
 	projector.SetStartAnchor(startNS)
 
 	// 1. Warm-up pre-window sweep strictly before startNS
