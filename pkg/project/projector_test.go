@@ -602,16 +602,10 @@ func TestProjectorCCM44LiveSubSecondPhaseNoClobber(t *testing.T) {
 		Size:           300.0,
 	})
 
-	// Tick @ 101.6s: triggers Flush(100.6s), committing phase_500ms @ 100.5s
-	_ = proj.IngestTick(feed.Tick{
-		SIPTimestampNS: 101_600_000_000,
-		Symbol:         "AAPL",
-		Type:           feed.TickQuote,
-		BidPx:          102.0,
-		AskPx:          102.10,
-		BidSz:          10.0,
-		AskSz:          10.0,
-	})
+	// Flush up to 100.6s commits phase_0ms @ 100.0s and phase_500ms @ 100.5s
+	if err := proj.Flush(100_600_000_000); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
 
 	barsP1 := prod.ReadHistoryBars(1, 0, 1)
 	if len(barsP1) != 1 {

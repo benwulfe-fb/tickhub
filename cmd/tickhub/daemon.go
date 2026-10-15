@@ -345,20 +345,15 @@ func runDaemon(args []string) {
 	startTime := time.Now()
 	lastReport := time.Now()
 
-	ticker := time.NewTicker(5 * time.Millisecond)
+	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 
 	flushNow := func(now time.Time) {
 		prod.PublishTelemetry(0, watermarkBufferNS, projector.LateDroppedTicks(), tickCount)
 
+		nowNS := now.UnixNano() + timeOffsetNS
 		var flushTarget int64
-		if projector.IsCCM44() {
-			vNow := projector.VirtualStreamNow(now)
-			if vNow > watermarkBufferNS {
-				flushTarget = vNow - watermarkBufferNS
-			}
-		} else {
-			nowNS := now.UnixNano() + timeOffsetNS
+		if nowNS > watermarkBufferNS {
 			flushTarget = nowNS - watermarkBufferNS
 		}
 

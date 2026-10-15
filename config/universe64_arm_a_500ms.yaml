@@ -1,5 +1,5 @@
 shm:
-  name: tickhub_test_arm_a
+  name: tickhub_live
   max_frames: 512
   cadence_interval: 1000000000
 features:
@@ -122,72 +122,72 @@ phases:
   - SPY
   - QQQ
   - AAOI
-  - ABBV
   - ADI
-  - AGQ
   - ALAB
-  - AMAT
   - ANET
-  - APH
   - APP
-  - ARM
   - ASTS
-  - BE
   - BIDU
-  - CDW
   - CEG
-  - CIEN
   - COF
-  - COHR
   - CRCL
-  - CRDO
   - CRWD
-  - CSCO
   - DASH
-  - DELL
   - ETN
-  - GE
   - GEV
-  - GLW
   - GS
-  - IBM
   - INTU
-  - IR
+  - ISRG
+  - LIN
+  - LLY
+  - LRCX
+  - MRVL
+  - NOC
+  - ORCL
+  - QCOM
+  - RKLB
+  - SHOP
+  - SNOW
+  - STX
+  - TMO
+  - TXN
+  - VRT
+  - WDC
 - id: 1
   name: phase_500ms
   offset_ms: 500
   symbols:
   - SPY
   - QQQ
-  - ISRG
+  - ABBV
+  - AGQ
+  - AMAT
+  - APH
+  - ARM
+  - BE
+  - CDW
+  - CIEN
+  - COHR
+  - CRDO
+  - CSCO
+  - DELL
+  - GE
+  - GLW
+  - IBM
+  - IR
   - KLAC
-  - LIN
   - LITE
-  - LLY
   - LMT
-  - LRCX
   - MELI
-  - MRVL
   - NBIS
-  - NOC
   - 'ON'
-  - ORCL
   - PANW
-  - QCOM
   - RDDT
-  - RKLB
   - RTX
-  - SHOP
   - SNDK
-  - SNOW
   - SPOT
-  - STX
   - TER
-  - TMO
   - TT
-  - TXN
   - VLO
-  - VRT
   - VST
-  - WDC
   - XOM

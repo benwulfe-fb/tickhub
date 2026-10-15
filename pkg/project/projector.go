@@ -525,7 +525,7 @@ func (p *Projector) ingestSortedCCM44Tick(tick feed.Tick, updateSnap bool) error
 			log.Printf("[PROJECTOR] Late tail tick past closed bar: %s %v ts=%d < boundary=%d (total: %d)",
 				tick.Symbol, tick.Type, ts, p.symNextSecondNS[uIdx]-p.cadenceNS, p.lateDroppedTicks)
 		}
-	} else {
+	} else if !p.isLiveMode {
 		for {
 			earliestPIdx := -1
 			var earliestPhaseAnchor int64 = 0
@@ -608,13 +608,9 @@ func (p *Projector) IngestTick(tick feed.Tick) error {
 				seq:  p.liveSeq,
 			})
 
-			// 4. Drain heap up to watermark cutoff
-			cutoff := p.maxSIPTimestampNS - p.watermarkBufferNS
-			for p.liveHeap.Len() > 0 && p.liveHeap.PeekItem().tick.SIPTimestampNS <= cutoff {
-				item := p.liveHeap.PopItem()
-				if err := p.ingestSortedCCM44Tick(item.tick, false); err != nil {
-					return err
-				}
+			// 4. Drain heap immediately if watermark buffer is 0 (direct test mode)
+			if p.watermarkBufferNS == 0 {
+				return p.Flush(tick.SIPTimestampNS)
 			}
 			return nil
 		}
@@ -808,15 +804,6 @@ func (p *Projector) updateSnapshot(uIdx int, tick feed.Tick) {
 // Flush closes remaining bars up to targetEndNS.
 func (p *Projector) Flush(targetEndNS int64) error {
 	if p.isCCM44 {
-		if p.isLiveMode {
-			for p.liveHeap.Len() > 0 && p.liveHeap.PeekItem().tick.SIPTimestampNS <= targetEndNS {
-				item := p.liveHeap.PopItem()
-				if err := p.ingestSortedCCM44Tick(item.tick, false); err != nil {
-					return err
-				}
-			}
-		}
-
 		for {
 			earliestPIdx := -1
 			var earliestPhaseAnchor int64 = 0
@@ -832,6 +819,14 @@ func (p *Projector) Flush(targetEndNS int64) error {
 
 			secReady := p.nextSecondAnchorNS > 0 && p.nextSecondAnchorNS <= targetEndNS
 			if secReady && (earliestPIdx < 0 || p.nextSecondAnchorNS <= earliestPhaseAnchor) {
+				if p.isLiveMode {
+					for p.liveHeap.Len() > 0 && p.liveHeap.PeekItem().tick.SIPTimestampNS < p.nextSecondAnchorNS {
+						item := p.liveHeap.PopItem()
+						if err := p.ingestSortedCCM44Tick(item.tick, false); err != nil {
+							return err
+						}
+					}
+				}
 				p.closeSecondBar(p.nextSecondAnchorNS)
 				p.nextSecondAnchorNS += p.cadenceNS
 				continue
@@ -841,11 +836,29 @@ func (p *Projector) Flush(targetEndNS int64) error {
 				break
 			}
 
+			if p.isLiveMode {
+				for p.liveHeap.Len() > 0 && p.liveHeap.PeekItem().tick.SIPTimestampNS <= earliestPhaseAnchor {
+					item := p.liveHeap.PopItem()
+					if err := p.ingestSortedCCM44Tick(item.tick, false); err != nil {
+						return err
+					}
+				}
+			}
+
 			if err := p.closePhase(earliestPIdx, earliestPhaseAnchor); err != nil {
 				return err
 			}
 			p.phaseNextAnchor[earliestPIdx] += p.cadenceNS
 			p.phaseSlots[earliestPIdx]++
+		}
+
+		if p.isLiveMode {
+			for p.liveHeap.Len() > 0 && p.liveHeap.PeekItem().tick.SIPTimestampNS <= targetEndNS {
+				item := p.liveHeap.PopItem()
+				if err := p.ingestSortedCCM44Tick(item.tick, false); err != nil {
+					return err
+				}
+			}
 		}
 	} else {
 		for pIdx := range p.phases {
