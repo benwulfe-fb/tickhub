@@ -24,7 +24,17 @@ func runWorker(args []string) {
 	configPath := fs.String("config", "examples/config_datalake.yaml", "Path to config.yaml")
 	datalakeDir := fs.String("datalake", "/mnt/wc/datalake", "Root datalake directory")
 	shmNameOverride := fs.String("shm-name", "", "Optional SHM segment name override (e.g. tickhub_worker_0)")
+	watermarkBufferStr := fs.String("watermark-buffer", "0s", "Optional watermark latency buffer (e.g. 100ms)")
 	fs.Parse(args)
+
+	var watermarkBufferNS int64 = 0
+	if *watermarkBufferStr != "" && *watermarkBufferStr != "0s" && *watermarkBufferStr != "0" {
+		if d, err := time.ParseDuration(*watermarkBufferStr); err == nil {
+			watermarkBufferNS = d.Nanoseconds()
+		} else {
+			log.Fatalf("[WORKER] Invalid --watermark-buffer %q: %v", *watermarkBufferStr, err)
+		}
+	}
 
 	cfgData, err := os.ReadFile(*configPath)
 	if err != nil {
@@ -119,7 +129,7 @@ func runWorker(args []string) {
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			t0 := time.Now()
-			numFrames, coldStart, firstAnchor, lastAnchor, err := serviceChunk(ctx, prod, phaseConfigs, rawCfg, *datalakeDir, sym, dateStr, startNS, endNS)
+			numFrames, coldStart, firstAnchor, lastAnchor, err := serviceChunk(ctx, prod, phaseConfigs, rawCfg, *datalakeDir, sym, dateStr, startNS, endNS, watermarkBufferNS)
 			cancel()
 			elapsed := time.Since(t0)
 
@@ -167,6 +177,7 @@ func serviceChunk(
 	dateStr string,
 	startNS int64,
 	endNS int64,
+	watermarkBufferNS int64,
 ) (int, int, int64, int64, error) {
 	letter := strings.ToUpper(string(sym[0]))
 	dayDir := filepath.Join(datalakeDir, dateStr, letter)
@@ -207,6 +218,13 @@ func serviceChunk(
 	projector := project.NewProjector(prod, phases, rawCfg.UniqueSymbols, cadence)
 	projector.SetTargetSymbol(sym)
 	projector.SetStartAnchor(startNS)
+	if watermarkBufferNS > 0 {
+		projector.SetWatermarkBuffer(time.Duration(watermarkBufferNS))
+	}
+	flushEndNS := endNS
+	if watermarkBufferNS > 0 && endNS > watermarkBufferNS {
+		flushEndNS = endNS - watermarkBufferNS
+	}
 
 	// 1. Warm-up pre-window sweep strictly before startNS
 	var lastBid, lastAsk, lastPrice float64
@@ -275,9 +293,9 @@ func serviceChunk(
 			}
 		}
 
-		// Flush up to endNS
-		if err := projector.Flush(endNS); err != nil {
-			return 0, 0, 0, 0, fmt.Errorf("flush @ %d: %w", endNS, err)
+		// Flush up to flushEndNS
+		if err := projector.Flush(flushEndNS); err != nil {
+			return 0, 0, 0, 0, fmt.Errorf("flush @ %d: %w", flushEndNS, err)
 		}
 		break
 	}
@@ -287,8 +305,8 @@ func serviceChunk(
 		if !projector.IsCCM44() && (hasPreQuote || hasPreTrade) {
 			projector.SeedState(sym, lastBid, lastAsk, lastPrice)
 		}
-		if err := projector.Flush(endNS); err != nil {
-			return 0, 0, 0, 0, fmt.Errorf("flush empty @ %d: %w", endNS, err)
+		if err := projector.Flush(flushEndNS); err != nil {
+			return 0, 0, 0, 0, fmt.Errorf("flush empty @ %d: %w", flushEndNS, err)
 		}
 	}
 

@@ -284,6 +284,12 @@ func (p *Projector) IsCCM44() bool {
 // SetWatermarkBuffer overrides the watermark latency buffer.
 func (p *Projector) SetWatermarkBuffer(d time.Duration) {
 	p.watermarkBufferNS = d.Nanoseconds()
+	if p.watermarkBufferNS > 0 && p.isCCM44 {
+		p.isLiveMode = true
+		if p.liveHeap.items == nil {
+			p.liveHeap = tickMinHeap{items: make([]liveTickItem, 0, 16384)}
+		}
+	}
 }
 
 // WatermarkBuffer returns the configured watermark latency buffer duration.
