@@ -51,6 +51,7 @@ type Producer struct {
 	header         *GlobalHeader
 	snapshots      []*SymbolSnapshot
 	microSnapshots []*SymbolMicroSnapshot
+	rings250ms     []*SymbolRing250ms
 	phaseOffsets   []uintptr
 	phaseStrides   []uintptr
 	symbolMap      map[string]int   // symbol name -> directory index
@@ -132,6 +133,7 @@ func CreateProducer(cfg Config) (*Producer, error) {
 	symMap := make(map[string]int)
 	snapshots := make([]*SymbolSnapshot, len(cfg.UniqueSymbols))
 	microSnapshots := make([]*SymbolMicroSnapshot, len(cfg.UniqueSymbols))
+	rings250ms := make([]*SymbolRing250ms, len(cfg.UniqueSymbols))
 
 	for i, s := range cfg.UniqueSymbols {
 		symMap[s] = i
@@ -149,6 +151,17 @@ func CreateProducer(cfg Config) (*Producer, error) {
 		// Point micro snapshot pointer to MicroSnapshotOffset + i*128
 		microPtr := (*SymbolMicroSnapshot)(unsafe.Pointer(&raw[MicroSnapshotOffset+uintptr(i*128)]))
 		microSnapshots[i] = microPtr
+
+		// Point 250ms ring pointer to Ring250msOffset + i*Ring250msSymbolSize
+		ringPtr := (*SymbolRing250ms)(unsafe.Pointer(&raw[Ring250msOffset+uintptr(i*Ring250msSymbolSize)]))
+		ringPtr.LastClosedCol = -1
+		ringPtr.FirstValidCol = -1
+		ringPtr.Trailing15mCnt = 1.0
+		ringPtr.Trailing15mQ = 1.0
+		for k := range ringPtr.Bars {
+			ringPtr.Bars[k].BucketCol = -1
+		}
+		rings250ms[i] = ringPtr
 	}
 
 	phaseSymMap := make([]map[string]int, len(cfg.Phases))
@@ -180,6 +193,7 @@ func CreateProducer(cfg Config) (*Producer, error) {
 		header:         header,
 		snapshots:      snapshots,
 		microSnapshots: microSnapshots,
+		rings250ms:     rings250ms,
 		phaseOffsets:   phaseOffsets,
 		phaseStrides:   phaseStrides,
 		symbolMap:      symMap,
@@ -278,12 +292,15 @@ func CreateProducerWithRecovery(cfg Config) (*Producer, uint32, error) {
 				symMap := make(map[string]int)
 				snapshots := make([]*SymbolSnapshot, len(cfg.UniqueSymbols))
 				microSnapshots := make([]*SymbolMicroSnapshot, len(cfg.UniqueSymbols))
+				rings250ms := make([]*SymbolRing250ms, len(cfg.UniqueSymbols))
 				for i, s := range cfg.UniqueSymbols {
 					symMap[s] = i
 					snapPtr := (*SymbolSnapshot)(unsafe.Pointer(&raw[SnapshotOffset+uintptr(i*128)]))
 					snapshots[i] = snapPtr
 					microPtr := (*SymbolMicroSnapshot)(unsafe.Pointer(&raw[MicroSnapshotOffset+uintptr(i*128)]))
 					microSnapshots[i] = microPtr
+					ringPtr := (*SymbolRing250ms)(unsafe.Pointer(&raw[Ring250msOffset+uintptr(i*Ring250msSymbolSize)]))
+					rings250ms[i] = ringPtr
 				}
 
 				phaseSymMap := make([]map[string]int, len(cfg.Phases))
@@ -326,6 +343,7 @@ func CreateProducerWithRecovery(cfg Config) (*Producer, uint32, error) {
 					header:         hdr,
 					snapshots:      snapshots,
 					microSnapshots: microSnapshots,
+					rings250ms:     rings250ms,
 					phaseOffsets:   phaseOffsets,
 					phaseStrides:   phaseStrides,
 					symbolMap:      symMap,
@@ -414,6 +432,9 @@ func (p *Producer) WriteMicroSnapshot(symbolIdx int, micro *SymbolMicroSnapshot)
 	target.VWAP5s = micro.VWAP5s
 	target.TradeImbalance5s = micro.TradeImbalance5s
 	target.TradeCount3s = micro.TradeCount3s
+	target.LastCol250ms = micro.LastCol250ms
+	target.Trailing15mCnt = micro.Trailing15mCnt
+	target.Trailing15mQ = micro.Trailing15mQ
 
 	// 3. Advance SeqLock sequence to EVEN (Store-Release)
 	atomic.StoreUint64(&target.SeqLockSeq, seq+1)
@@ -711,6 +732,19 @@ func (p *Producer) MicroSnapshot(symbolIdx int) *SymbolMicroSnapshot {
 // MicroSnapshots returns all symbol micro snapshots.
 func (p *Producer) MicroSnapshots() []*SymbolMicroSnapshot {
 	return p.microSnapshots
+}
+
+// Ring250ms returns the 250ms ring buffer pointer for symbol directory index.
+func (p *Producer) Ring250ms(symbolIdx int) *SymbolRing250ms {
+	if symbolIdx < 0 || symbolIdx >= len(p.rings250ms) {
+		return nil
+	}
+	return p.rings250ms[symbolIdx]
+}
+
+// Rings250ms returns all symbol 250ms ring buffers.
+func (p *Producer) Rings250ms() []*SymbolRing250ms {
+	return p.rings250ms
 }
 
 // SetFrameFlags sets the Flags bitfield on the FrameHeader for phaseIdx at anchorNS.

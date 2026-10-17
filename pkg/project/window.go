@@ -3,6 +3,7 @@ package project
 import (
 	"math"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/benwulfe-fb/tickhub/pkg/shm"
@@ -1085,4 +1086,303 @@ func (h *SymbolHistory) WriteCCMTerminalState(out *[44]float64) {
 	out[42] = float64(h.ccmCumQuotes)
 	out[43] = float64(h.ccmCumTrades)
 }
+
+const (
+	bucket250msNS   = 250_000_000
+	baseline15mBars = 3600
+	atMidEps250ms   = 1e-6
+)
+
+var nyLoc250ms *time.Location
+
+func init() {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		loc = time.FixedZone("EDT", -4*3600)
+	}
+	nyLoc250ms = loc
+}
+
+// Tracker250ms tracks 250ms buckets, causal forward-filled mid ticks, and 15-minute (3600-bucket)
+// trailing baseline sums per symbol to populate shm.SymbolRing250ms and shm.SymbolMicroSnapshot.
+type Tracker250ms struct {
+	openNS        int64
+	openSet       bool
+	nextCol       int64
+	lastClosedCol int64
+
+	hasValidQuote bool
+	lastBid       float64
+	lastAsk       float64
+	lastBidTicks  int32
+	lastAskTicks  int32
+	firstValidCol int64
+	firstValidBid int32
+	firstValidAsk int32
+	lastMidTicks  float64
+	hasValidMid   bool
+
+	curLitBuyVol  float64
+	curLitSellVol float64
+
+	csNB     float64
+	csNS     float64
+	csQB     float64
+	csQS     float64
+	csNBRing [baseline15mBars + 1]float64
+	csNSRing [baseline15mBars + 1]float64
+	csQBRing [baseline15mBars + 1]float64
+	csQSRing [baseline15mBars + 1]float64
+
+	lastCnt15m float64
+	lastQ15m   float64
+}
+
+// Init initializes Tracker250ms state and resets the SHM SymbolRing250ms header if present.
+func (t *Tracker250ms) Init(ring *shm.SymbolRing250ms) {
+	t.openNS = 0
+	t.openSet = false
+	t.nextCol = 0
+	t.lastClosedCol = -1
+	t.hasValidQuote = false
+	t.lastBid = 0
+	t.lastAsk = 0
+	t.lastBidTicks = 0
+	t.lastAskTicks = 0
+	t.firstValidCol = -1
+	t.firstValidBid = 0
+	t.firstValidAsk = 0
+	t.lastMidTicks = 10000.0
+	t.hasValidMid = false
+	t.curLitBuyVol = 0.0
+	t.curLitSellVol = 0.0
+	t.csNB = 0.0
+	t.csNS = 0.0
+	t.csQB = 0.0
+	t.csQS = 0.0
+	t.lastCnt15m = 1.0
+	t.lastQ15m = 1.0
+	if ring != nil {
+		seq := atomic.AddUint64(&ring.SeqLockSeq, 1)
+		ring.OpenNS = 0
+		ring.LastClosedCol = -1
+		ring.FirstValidCol = -1
+		ring.FirstValidBid = 0
+		ring.FirstValidAsk = 0
+		ring.Trailing15mCnt = 1.0
+		ring.Trailing15mQ = 1.0
+		ring.LiveBidTicks = 0
+		ring.LiveAskTicks = 0
+		for k := range ring.Bars {
+			ring.Bars[k] = shm.Bar250ms{BucketCol: -1}
+		}
+		atomic.StoreUint64(&ring.SeqLockSeq, seq+1)
+	}
+}
+
+func (t *Tracker250ms) ensureOpenNS(ts int64, ring *shm.SymbolRing250ms) {
+	if t.openSet || ts <= 0 {
+		return
+	}
+	if ts < 1_000_000_000_000_000_000 {
+		t.openNS = 0
+	} else {
+		tm := time.Unix(0, ts).In(nyLoc250ms)
+		rthOpen := time.Date(tm.Year(), tm.Month(), tm.Day(), 9, 30, 0, 0, nyLoc250ms).UnixNano()
+		rthClose := rthOpen + 23400*1_000_000_000
+		if ts <= rthClose {
+			t.openNS = rthOpen
+		} else {
+			t.openNS = (ts / 1_000_000_000) * 1_000_000_000
+		}
+	}
+	t.openSet = true
+}
+
+// LastClosedCol returns the index of the latest closed 250ms bucket (-1 if none).
+func (t *Tracker250ms) LastClosedCol() int32 {
+	return int32(t.lastClosedCol)
+}
+
+// Trailing15mCnt returns the latest trailing 15-minute (3600-bucket) trade-count baseline sum.
+func (t *Tracker250ms) Trailing15mCnt() float32 {
+	return float32(t.lastCnt15m)
+}
+
+// Trailing15mQ returns the latest trailing 15-minute (3600-bucket) sqrt-volume baseline sum.
+func (t *Tracker250ms) Trailing15mQ() float32 {
+	return float32(t.lastQ15m)
+}
+
+// AdvanceTo closes all 250ms buckets b with openNS + (b + 1) * 250_000_000 <= ts.
+func (t *Tracker250ms) AdvanceTo(ts int64, ring *shm.SymbolRing250ms) {
+	if ts <= 0 {
+		return
+	}
+	if !t.openSet {
+		t.ensureOpenNS(ts, ring)
+	}
+	if ts < t.openNS+(t.nextCol+1)*bucket250msNS {
+		return
+	}
+	targetCol := (ts-t.openNS)/bucket250msNS - 1
+	if targetCol < t.nextCol {
+		return
+	}
+	if t.lastClosedCol < 0 && targetCol > shm.MaxRing250msBars {
+		t.nextCol = targetCol - shm.MaxRing250msBars
+	} else if targetCol-t.nextCol > 100000 {
+		t.nextCol = targetCol - baseline15mBars
+	}
+
+	var seq uint64
+	if ring != nil {
+		seq = atomic.AddUint64(&ring.SeqLockSeq, 1)
+	}
+
+	for b := t.nextCol; b <= targetCol; b++ {
+		bidTicks := t.lastBidTicks
+		askTicks := t.lastAskTicks
+		vb := t.curLitBuyVol
+		vs := t.curLitSellVol
+		t.curLitBuyVol = 0.0
+		t.curLitSellVol = 0.0
+
+		if t.hasValidQuote && t.firstValidCol < 0 {
+			t.firstValidCol = b
+			t.firstValidBid = bidTicks
+			t.firstValidAsk = askTicks
+		}
+
+		if bidTicks > 0 && askTicks > bidTicks {
+			t.hasValidMid = true
+			t.lastMidTicks = 0.5 * float64(bidTicks+askTicks)
+		} else if !t.hasValidMid {
+			t.lastMidTicks = 10000.0
+		}
+
+		var nb, ns float64
+		if vb > 0.0 {
+			nb += 1.0
+			if vb >= 200.0 {
+				nb += 1.0
+			}
+			if vb >= 800.0 {
+				nb += 1.0
+			}
+		}
+		if vs > 0.0 {
+			ns += 1.0
+			if vs >= 200.0 {
+				ns += 1.0
+			}
+			if vs >= 800.0 {
+				ns += 1.0
+			}
+		}
+		var qb, qs float64
+		if vb > 0.0 {
+			qb = math.Sqrt(vb)
+		}
+		if vs > 0.0 {
+			qs = math.Sqrt(vs)
+		}
+
+		t.csNB += nb
+		t.csNS += ns
+		t.csQB += qb
+		t.csQS += qs
+
+		enRing := int((b + 1) % (baseline15mBars + 1))
+		t.csNBRing[enRing] = t.csNB
+		t.csNSRing[enRing] = t.csNS
+		t.csQBRing[enRing] = t.csQB
+		t.csQSRing[enRing] = t.csQS
+
+		st := b - baseline15mBars + 1
+		if st < 0 {
+			st = 0
+		}
+		stRing := int(st % (baseline15mBars + 1))
+		cnt15m := (t.csNB - t.csNBRing[stRing]) + (t.csNS - t.csNSRing[stRing])
+		if cnt15m < 1.0 {
+			cnt15m = 1.0
+		}
+		q15m := (t.csQB - t.csQBRing[stRing]) + (t.csQS - t.csQSRing[stRing])
+		if q15m < 1.0 {
+			q15m = 1.0
+		}
+		t.lastCnt15m = cnt15m
+		t.lastQ15m = q15m
+		t.lastClosedCol = b
+		t.nextCol = b + 1
+
+		if ring != nil {
+			slot := b & (shm.MaxRing250msBars - 1)
+			ring.Bars[slot] = shm.Bar250ms{
+				BucketCol:  b,
+				BidTicks:   bidTicks,
+				AskTicks:   askTicks,
+				LitBuyVol:  vb,
+				LitSellVol: vs,
+				Cnt15m:     cnt15m,
+				Q15m:       q15m,
+				MidTicks:   t.lastMidTicks,
+			}
+			if t.firstValidCol == b && b > 0 {
+				for k := int64(0); k < shm.MaxRing250msBars; k++ {
+					if ring.Bars[k].BucketCol >= 0 && ring.Bars[k].BucketCol < b && ring.Bars[k].BidTicks == 0 {
+						ring.Bars[k].BidTicks = bidTicks
+						ring.Bars[k].AskTicks = askTicks
+					}
+				}
+			}
+		}
+	}
+
+	if ring != nil {
+		ring.OpenNS = t.openNS
+		ring.LastClosedCol = t.lastClosedCol
+		ring.FirstValidCol = t.firstValidCol
+		ring.FirstValidBid = t.firstValidBid
+		ring.FirstValidAsk = t.firstValidAsk
+		ring.Trailing15mCnt = t.lastCnt15m
+		ring.Trailing15mQ = t.lastQ15m
+		ring.LiveBidTicks = t.lastBidTicks
+		ring.LiveAskTicks = t.lastAskTicks
+		atomic.StoreUint64(&ring.SeqLockSeq, seq+1)
+	}
+}
+
+// OnQuote ingests a quote into the 250ms tracker, closing any completed buckets prior to ts.
+func (t *Tracker250ms) OnQuote(ts int64, bidPx, askPx float64, ring *shm.SymbolRing250ms) {
+	if !(bidPx > 0.0 && askPx >= bidPx) {
+		return
+	}
+	t.AdvanceTo(ts, ring)
+	t.hasValidQuote = true
+	t.lastBid = bidPx
+	t.lastAsk = askPx
+	t.lastBidTicks = int32(math.RoundToEven(bidPx * 10000.0))
+	t.lastAskTicks = int32(math.RoundToEven(askPx * 10000.0))
+}
+
+// OnTrade ingests a trade into the 250ms tracker, closing any completed buckets prior to ts
+// and classifying lit volume against the contemporaneous matched quote midpoint.
+func (t *Tracker250ms) OnTrade(ts int64, price, size float64, isDark bool, ring *shm.SymbolRing250ms) {
+	if !(price > 0.0 && size > 0.0) {
+		return
+	}
+	t.AdvanceTo(ts, ring)
+	if !t.openSet || ts < t.openNS || !t.hasValidQuote || isDark {
+		return
+	}
+	midU := 0.5 * (t.lastBid + t.lastAsk)
+	if price < midU-atMidEps250ms {
+		t.curLitSellVol += size
+	} else if price > midU+atMidEps250ms {
+		t.curLitBuyVol += size
+	}
+}
+
 

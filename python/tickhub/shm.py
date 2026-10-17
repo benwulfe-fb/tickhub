@@ -24,6 +24,9 @@ from .abi import (
     MODE_LIVE_STREAMING,
     SNAPSHOT_OFFSET,
     MICRO_SNAPSHOT_OFFSET,
+    RING_250MS_OFFSET,
+    MAX_RING_250MS_BARS,
+    RING_250MS_SYMBOL_SIZE,
     CONFIG_AREA_OFFSET,
     MAX_CONFIG_BYTES,
     FLAG_COLD_START,
@@ -38,16 +41,31 @@ from .abi import (
     CONTROL_STATUS_READY,
     CONTROL_STATUS_ERROR,
     CONTROL_STATUS_EOF,
+    Bar250ms,
     ControlRequest,
     ControlResponse,
     FrameHeader,
     GlobalHeader,
     PhaseInfo,
     SymbolDirectoryEntry,
+    SymbolRing250ms,
     SymbolSnapshot,
     SymbolMicroSnapshot,
 )
 from .atomic import cpu_pause, load_acquire_i64, thread_fence_acquire, thread_fence_release
+
+_BAR_250MS_DTYPE = np.dtype([
+    ("bucket_col", "<i8"),
+    ("bid_ticks", "<i4"),
+    ("ask_ticks", "<i4"),
+    ("lit_buy_vol", "<f8"),
+    ("lit_sell_vol", "<f8"),
+    ("cnt_15m", "<f8"),
+    ("q_15m", "<f8"),
+    ("mid_ticks", "<f8"),
+    ("_pad", "<u8"),
+])
+assert _BAR_250MS_DTYPE.itemsize == 64
 
 
 CCM_44_FEATURES: tuple[str, ...] = (
@@ -688,6 +706,9 @@ class TickHubReader:
                     vwap_5s = micro.vwap_5s
                     t_imb_5s = micro.trade_imbalance_5s
                     t_cnt_3s = micro.trade_count_3s
+                    last_col_250ms = micro.last_col_250ms
+                    t_15m_cnt = micro.trailing_15m_cnt
+                    t_15m_q = micro.trailing_15m_q
                     thread_fence_acquire()
                     mseq2 = load_acquire_i64(micro_seq_addr)
                     if mseq1 == mseq2:
@@ -704,6 +725,9 @@ class TickHubReader:
                         out["vwap_5s"] = vwap_5s
                         out["trade_imbalance_5s"] = t_imb_5s
                         out["trade_count_3s"] = int(t_cnt_3s)
+                        out["last_col_250ms"] = int(last_col_250ms)
+                        out["trailing_15m_cnt"] = float(t_15m_cnt)
+                        out["trailing_15m_q"] = float(t_15m_q)
                         break
                     cpu_pause()
                 return out
@@ -1262,6 +1286,175 @@ class TickHubReader:
         skew_arr[span_s] = prev_skew
 
         return proj_res
+
+    def load_window_250ms(
+        self,
+        symbol: str,
+        col: Optional[int] = None,
+        now_ns: Optional[int] = None,
+        n_bars: int = 41,
+    ) -> Optional[dict[str, Any]]:
+        """Loads the trailing `n_bars` (default 41) 250ms buckets and 15-minute baseline directly from SHM."""
+        if symbol not in self._symbol_to_dir_idx:
+            raise KeyError(f"Symbol '{symbol}' not found in directory")
+
+        dir_idx = self._symbol_to_dir_idx[symbol]
+        ring_offset = RING_250MS_OFFSET + dir_idx * RING_250MS_SYMBOL_SIZE
+        if ring_offset + RING_250MS_SYMBOL_SIZE > self._file_size:
+            return None
+
+        seq_addr = self._base_addr + ring_offset
+        ring_hdr = SymbolRing250ms.from_address(seq_addr)
+        bars_offset = ring_offset + 64
+
+        open_ns = 0
+        last_closed_col = -1
+        first_valid_col = -1
+        first_valid_bid = 0
+        first_valid_ask = 0
+        trailing_15m_cnt = 1.0
+        trailing_15m_q = 1.0
+        live_bid_ticks = 0
+        live_ask_ticks = 0
+        bars_snap: Optional[np.ndarray] = None
+
+        for _ in range(100):
+            seq1 = load_acquire_i64(seq_addr)
+            if seq1 & 1 != 0:
+                cpu_pause()
+                continue
+            thread_fence_acquire()
+            open_ns = int(ring_hdr.open_ns)
+            last_closed_col = int(ring_hdr.last_closed_col)
+            first_valid_col = int(ring_hdr.first_valid_col)
+            first_valid_bid = int(ring_hdr.first_valid_bid)
+            first_valid_ask = int(ring_hdr.first_valid_ask)
+            trailing_15m_cnt = float(ring_hdr.trailing_15m_cnt)
+            trailing_15m_q = float(ring_hdr.trailing_15m_q)
+            live_bid_ticks = int(ring_hdr.live_bid_ticks)
+            live_ask_ticks = int(ring_hdr.live_ask_ticks)
+            bars_snap = np.frombuffer(
+                self._mmap,
+                dtype=_BAR_250MS_DTYPE,
+                count=MAX_RING_250MS_BARS,
+                offset=bars_offset,
+            ).copy()
+            thread_fence_acquire()
+            seq2 = load_acquire_i64(seq_addr)
+            if seq1 == seq2:
+                break
+            bars_snap = None
+            cpu_pause()
+
+        if bars_snap is None or last_closed_col < 0:
+            return None
+
+        if col is not None:
+            target_col = int(col)
+            b = min(target_col - 2, last_closed_col)
+        elif now_ns is not None:
+            now_ns_i = int(now_ns)
+            if now_ns_i >= 1_000_000_000_000_000_000 and open_ns > 0:
+                target_col = int((now_ns_i - open_ns) // 250_000_000)
+            else:
+                target_col = int(now_ns_i // 250_000_000)
+            b = min(target_col - 2, last_closed_col)
+        else:
+            b = last_closed_col
+            target_col = b + 2
+
+        if b < 0:
+            return None
+
+        cols = np.arange(b - (n_bars - 1), b + 1, dtype=np.int64)
+        neg_mask = cols < 0
+        cols_clamped = np.maximum(0, cols)
+        slots = cols_clamped & (MAX_RING_250MS_BARS - 1)
+        sel = bars_snap[slots]
+        valid_mask = sel["bucket_col"] == cols_clamped
+        if not np.any(valid_mask):
+            return None
+
+        bid_arr = sel["bid_ticks"].astype(np.int32, copy=True)
+        ask_arr = sel["ask_ticks"].astype(np.int32, copy=True)
+        mid_arr = sel["mid_ticks"].astype(np.float64, copy=True)
+        vb_arr = sel["lit_buy_vol"].astype(np.float64, copy=True)
+        vs_arr = sel["lit_sell_vol"].astype(np.float64, copy=True)
+
+        if not np.all(valid_mask):
+            valid_idx = np.flatnonzero(valid_mask)
+            first_v = int(valid_idx[0])
+            fb_bid = first_valid_bid if first_valid_bid > 0 else int(bid_arr[first_v])
+            fb_ask = first_valid_ask if first_valid_ask > 0 else int(ask_arr[first_v])
+            fb_mid = 0.5 * float(fb_bid + fb_ask) if (fb_bid > 0 and fb_ask > fb_bid) else 10000.0
+            inv_mask = ~valid_mask
+            bid_arr[inv_mask] = fb_bid
+            ask_arr[inv_mask] = fb_ask
+            mid_arr[inv_mask] = fb_mid
+            vb_arr[inv_mask] = 0.0
+            vs_arr[inv_mask] = 0.0
+
+        if np.any(neg_mask):
+            vb_arr[neg_mask] = 0.0
+            vs_arr[neg_mask] = 0.0
+
+        if valid_mask[-1]:
+            cnt_15m = float(sel["cnt_15m"][-1])
+            q_15m = float(sel["q_15m"][-1])
+        else:
+            cnt_15m = max(1.0, trailing_15m_cnt)
+            q_15m = max(1.0, trailing_15m_q)
+
+        prev1_col = target_col - 1
+        prev1_slot = prev1_col & (MAX_RING_250MS_BARS - 1)
+        if prev1_col >= 0 and int(bars_snap[prev1_slot]["bucket_col"]) == prev1_col:
+            bid_prev1 = int(bars_snap[prev1_slot]["bid_ticks"])
+            ask_prev1 = int(bars_snap[prev1_slot]["ask_ticks"])
+        else:
+            snap_offset = SNAPSHOT_OFFSET + dir_idx * 128
+            snap_seq_addr = self._base_addr + snap_offset
+            snap_hdr = SymbolSnapshot.from_address(snap_seq_addr)
+            nbbo_bid = 0
+            nbbo_ask = 0
+            for _ in range(100):
+                sseq1 = load_acquire_i64(snap_seq_addr)
+                if sseq1 & 1 != 0:
+                    cpu_pause()
+                    continue
+                thread_fence_acquire()
+                b_px = float(snap_hdr.bid_px)
+                a_px = float(snap_hdr.ask_px)
+                thread_fence_acquire()
+                sseq2 = load_acquire_i64(snap_seq_addr)
+                if sseq1 == sseq2:
+                    if b_px > 0.0 and a_px > 0.0:
+                        nbbo_bid = int(round(b_px * 10000.0))
+                        nbbo_ask = int(round(a_px * 10000.0))
+                    break
+                cpu_pause()
+            if nbbo_bid > 0 and nbbo_ask > 0:
+                bid_prev1 = nbbo_bid
+                ask_prev1 = nbbo_ask
+            else:
+                bid_prev1 = live_bid_ticks if live_bid_ticks > 0 else int(bid_arr[-1])
+                ask_prev1 = live_ask_ticks if live_ask_ticks > 0 else int(ask_arr[-1])
+
+        return {
+            "col": int(target_col),
+            "b": int(b),
+            "last_closed_col": int(last_closed_col),
+            "all_bars_valid": bool(np.all(valid_mask)),
+            "open_ns": int(open_ns),
+            "bid": bid_arr,
+            "ask": ask_arr,
+            "mid": mid_arr,
+            "lit_buy_vol": vb_arr,
+            "lit_sell_vol": vs_arr,
+            "cnt_15m": cnt_15m,
+            "q_15m": q_15m,
+            "bid_prev1": int(bid_prev1),
+            "ask_prev1": int(ask_prev1),
+        }
 
     def close(self) -> None:
         """Closes memory map and underlying file descriptor."""

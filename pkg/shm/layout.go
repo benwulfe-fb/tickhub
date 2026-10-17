@@ -11,10 +11,13 @@ const (
 	SnapshotOffset      uintptr = 0x00001000
 	ConfigAreaOffset    uintptr = 0x00005000
 	MicroSnapshotOffset uintptr = 0x0000C000 // 128 symbols * 128B = 16 KB (0x0000C000 to 0x00010000)
-	DataAreaOffset      uintptr = 0x00010000 // 64 KB boundary (page aligned)
+	Ring250msOffset     uintptr = 0x00010000 // 128 symbols * 4160B = 532,480 B (0x00010000 to 0x00092000)
+	DataAreaOffset      uintptr = 0x000A0000 // 64 KB boundary (page aligned)
 
 	MaxDirectorySymbols = 192
 	MaxSnapshotSymbols  = 128
+	MaxRing250msBars    = 64
+	Ring250msSymbolSize = 4160 // 64B header + 64 * 64B Bar250ms
 	MaxPhases           = 8
 	MaxConfigBytes      = 0x00007000 // 28 KB (0x00005000 to 0x0000C000)
 
@@ -176,7 +179,37 @@ type SymbolMicroSnapshot struct {
 	VWAP5s           float64
 	TradeImbalance5s float64
 	TradeCount3s     uint32
-	_pad             [12]byte
+	LastCol250ms     int32
+	Trailing15mCnt   float32
+	Trailing15mQ     float32
+}
+
+// Bar250ms holds a single closed 250ms bucket's quote, lit flow, and 15m baseline state (64 bytes).
+type Bar250ms struct {
+	BucketCol  int64
+	BidTicks   int32
+	AskTicks   int32
+	LitBuyVol  float64
+	LitSellVol float64
+	Cnt15m     float64
+	Q15m       float64
+	MidTicks   float64
+	_pad       int64
+}
+
+// SymbolRing250ms holds a per-symbol 64-bar 250ms ring buffer and 15m trailing baseline protected by a SeqLock (4,160 bytes).
+type SymbolRing250ms struct {
+	SeqLockSeq     uint64
+	OpenNS         int64
+	LastClosedCol  int64
+	FirstValidCol  int64
+	FirstValidBid  int32
+	FirstValidAsk  int32
+	Trailing15mCnt float64
+	Trailing15mQ   float64
+	LiveBidTicks   int32
+	LiveAskTicks   int32
+	Bars           [MaxRing250msBars]Bar250ms
 }
 
 // FrameHeader starts each frame in a phase ring buffer (64 bytes).
@@ -198,6 +231,8 @@ var (
 	_ [16]byte   = [unsafe.Sizeof(SymbolDirectoryEntry{})]byte{}
 	_ [128]byte  = [unsafe.Sizeof(SymbolSnapshot{})]byte{}
 	_ [128]byte  = [unsafe.Sizeof(SymbolMicroSnapshot{})]byte{}
+	_ [64]byte   = [unsafe.Sizeof(Bar250ms{})]byte{}
+	_ [4160]byte = [unsafe.Sizeof(SymbolRing250ms{})]byte{}
 	_ [64]byte   = [unsafe.Sizeof(FrameHeader{})]byte{}
 	_ [32]byte   = [unsafe.Sizeof(PhaseInfo{})]byte{}
 

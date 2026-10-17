@@ -125,6 +125,7 @@ type Projector struct {
 	snapshots      []shm.SymbolSnapshot
 	microTrackers  []MicroTracker
 	microSnapshots []shm.SymbolMicroSnapshot
+	trackers250ms  []Tracker250ms
 
 	firstCommittedAnchor   int64
 	lastCommittedAnchor    int64
@@ -236,6 +237,15 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 		liveHeap = tickMinHeap{items: make([]liveTickItem, 0, 16384)}
 	}
 
+	trackers250ms := make([]Tracker250ms, len(uniqueSymbols))
+	for i := range trackers250ms {
+		var ring *shm.SymbolRing250ms
+		if producer != nil {
+			ring = producer.Ring250ms(i)
+		}
+		trackers250ms[i].Init(ring)
+	}
+
 	return &Projector{
 		producer:          producer,
 		cadenceNS:         cadenceNS,
@@ -262,6 +272,7 @@ func NewProjector(producer *shm.Producer, phases []shm.PhaseConfig, uniqueSymbol
 		snapshots:         make([]shm.SymbolSnapshot, len(uniqueSymbols)),
 		microTrackers:     make([]MicroTracker, len(uniqueSymbols)),
 		microSnapshots:    make([]shm.SymbolMicroSnapshot, len(uniqueSymbols)),
+		trackers250ms:     trackers250ms,
 	}
 }
 
@@ -360,8 +371,13 @@ func (p *Projector) SeedState(symbol string, lastBid, lastAsk, lastPrice float64
 		p.producer.WriteSnapshot(uIdx, snap)
 		mt := &p.microTrackers[uIdx]
 		mt.SeedQuote(lastBid, lastAsk)
+		t250 := &p.trackers250ms[uIdx]
+		t250.OnQuote(0, lastBid, lastAsk, p.producer.Ring250ms(uIdx))
 		micro := &p.microSnapshots[uIdx]
 		mt.ComputeSnapshot(0, micro)
+		micro.LastCol250ms = t250.LastClosedCol()
+		micro.Trailing15mCnt = t250.Trailing15mCnt()
+		micro.Trailing15mQ = t250.Trailing15mQ()
 		p.producer.WriteMicroSnapshot(uIdx, micro)
 	}
 }
@@ -439,20 +455,29 @@ func (p *Projector) IngestPreWindowTick(tick feed.Tick) {
 	if !ok {
 		return
 	}
+	t250 := &p.trackers250ms[uIdx]
+	ring250 := p.producer.Ring250ms(uIdx)
 	if p.isCCM44 {
 		hist := p.uniqueHistories[uIdx]
 		if tick.Type == feed.TickTrade {
 			p.updateSnapshot(uIdx, tick)
 			hist.IngestPreWindowCCMTrade(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch)
+			t250.OnTrade(tick.SIPTimestampNS, tick.Price, tick.Size, tick.IsDark, ring250)
 		} else {
 			if !hist.AcceptQuote(tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz) {
 				return
 			}
 			p.updateSnapshot(uIdx, tick)
 			hist.IngestPreWindowCCMQuote(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz, tick.BidExch, tick.AskExch)
+			t250.OnQuote(tick.SIPTimestampNS, tick.BidPx, tick.AskPx, ring250)
 		}
 	} else {
 		p.updateSnapshot(uIdx, tick)
+		if tick.Type == feed.TickTrade {
+			t250.OnTrade(tick.SIPTimestampNS, tick.Price, tick.Size, tick.IsDark, ring250)
+		} else {
+			t250.OnQuote(tick.SIPTimestampNS, tick.BidPx, tick.AskPx, ring250)
+		}
 	}
 }
 
@@ -564,18 +589,22 @@ func (p *Projector) ingestSortedCCM44Tick(tick feed.Tick, updateSnap bool) error
 		p.updateSnapshot(uIdx, tick)
 	}
 
+	t250 := &p.trackers250ms[uIdx]
+	ring250 := p.producer.Ring250ms(uIdx)
 	hist := p.uniqueHistories[uIdx]
 	if tick.Type == feed.TickTrade {
 		if isLate {
 			hist.IngestPreWindowCCMTrade(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch)
 		} else {
 			hist.IngestCCMTrade(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.Price, tick.Size, tick.TradeExch, tick.IsDark)
+			t250.OnTrade(tick.SIPTimestampNS, tick.Price, tick.Size, tick.IsDark, ring250)
 		}
 	} else {
 		if isLate {
 			hist.IngestPreWindowCCMQuote(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz, tick.BidExch, tick.AskExch)
 		} else {
 			hist.IngestCCMQuote(tick.SIPTimestampNS, tick.ParticipantTimestampNS, tick.BidPx, tick.AskPx, tick.BidSz, tick.AskSz, tick.BidExch, tick.AskExch)
+			t250.OnQuote(tick.SIPTimestampNS, tick.BidPx, tick.AskPx, ring250)
 		}
 	}
 	return nil
@@ -664,6 +693,13 @@ func (p *Projector) IngestTick(tick feed.Tick) error {
 	// 3. Update top-of-book snapshot for unique symbol
 	if uIdx, ok := p.symToUnique[tick.Symbol]; ok {
 		p.updateSnapshot(uIdx, tick)
+		t250 := &p.trackers250ms[uIdx]
+		ring250 := p.producer.Ring250ms(uIdx)
+		if tick.Type == feed.TickTrade {
+			t250.OnTrade(tick.SIPTimestampNS, tick.Price, tick.Size, tick.IsDark, ring250)
+		} else {
+			t250.OnQuote(tick.SIPTimestampNS, tick.BidPx, tick.AskPx, ring250)
+		}
 	}
 
 	// 4. Update rolling history for all phases containing this symbol (including cross-assets)
@@ -697,6 +733,7 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 			if !ok {
 				continue
 			}
+			p.trackers250ms[uIdx].AdvanceTo(anchorNS, p.producer.Ring250ms(uIdx))
 			for p.symNextSecondNS[uIdx] <= anchorFloorNS {
 				p.closeSymbolSecondBar(uIdx, p.symNextSecondNS[uIdx])
 			}
@@ -723,6 +760,9 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 		for sIdx, sym := range pCfg.Symbols {
 			if p.targetSymbol != "" && sym != p.targetSymbol {
 				continue
+			}
+			if uIdx, ok := p.symToUnique[sym]; ok {
+				p.trackers250ms[uIdx].AdvanceTo(anchorNS, p.producer.Ring250ms(uIdx))
 			}
 			hist := p.histories[pIdx][sIdx]
 			r1, r5, r15, v1, sp := hist.CloseBar(slot)
@@ -756,7 +796,9 @@ func (p *Projector) closePhase(pIdx int, anchorNS int64) error {
 	if p.firstCommittedAnchor == 0 {
 		p.firstCommittedAnchor = anchorNS
 	}
-	p.lastCommittedAnchor = anchorNS
+	if p.lastCommittedAnchor = anchorNS; p.lastCommittedAnchor < anchorNS {
+		p.lastCommittedAnchor = anchorNS
+	}
 	p.totalCommittedFrames++
 
 	if pIdx == len(p.phases)-1 && p.coldStartBarsRemaining > 0 {
@@ -879,19 +921,33 @@ func (p *Projector) Flush(targetEndNS int64) error {
 	if snapTS > 0 {
 		if p.targetSymbol != "" {
 			if uIdx, ok := p.symToUnique[p.targetSymbol]; ok {
+				t250 := &p.trackers250ms[uIdx]
+				t250.AdvanceTo(targetEndNS, p.producer.Ring250ms(uIdx))
 				mt := &p.microTrackers[uIdx]
+				micro := &p.microSnapshots[uIdx]
 				if mt.initialized {
-					micro := &p.microSnapshots[uIdx]
 					mt.ComputeSnapshot(snapTS, micro)
+				}
+				micro.LastCol250ms = t250.LastClosedCol()
+				micro.Trailing15mCnt = t250.Trailing15mCnt()
+				micro.Trailing15mQ = t250.Trailing15mQ()
+				if mt.initialized || micro.LastCol250ms >= 0 {
 					p.producer.WriteMicroSnapshot(uIdx, micro)
 				}
 			}
 		} else {
 			for uIdx := range p.microTrackers {
+				t250 := &p.trackers250ms[uIdx]
+				t250.AdvanceTo(targetEndNS, p.producer.Ring250ms(uIdx))
 				mt := &p.microTrackers[uIdx]
+				micro := &p.microSnapshots[uIdx]
 				if mt.initialized {
-					micro := &p.microSnapshots[uIdx]
 					mt.ComputeSnapshot(snapTS, micro)
+				}
+				micro.LastCol250ms = t250.LastClosedCol()
+				micro.Trailing15mCnt = t250.Trailing15mCnt()
+				micro.Trailing15mQ = t250.Trailing15mQ()
+				if mt.initialized || micro.LastCol250ms >= 0 {
 					p.producer.WriteMicroSnapshot(uIdx, micro)
 				}
 			}

@@ -8,10 +8,13 @@ DIRECTORY_OFFSET = 0x00000400
 SNAPSHOT_OFFSET = 0x00001000
 CONFIG_AREA_OFFSET = 0x00005000
 MICRO_SNAPSHOT_OFFSET = 0x0000C000
-DATA_AREA_OFFSET = 0x00010000
+RING_250MS_OFFSET = 0x00010000
+DATA_AREA_OFFSET = 0x000A0000
 
 MAX_DIRECTORY_SYMBOLS = 192
 MAX_SNAPSHOT_SYMBOLS = 128
+MAX_RING_250MS_BARS = 64
+RING_250MS_SYMBOL_SIZE = 4160
 MAX_PHASES = 8
 MAX_CONFIG_BYTES = 0x00007000
 
@@ -160,7 +163,39 @@ class SymbolMicroSnapshot(ctypes.Structure):
         ("vwap_5s", ctypes.c_double),
         ("trade_imbalance_5s", ctypes.c_double),
         ("trade_count_3s", ctypes.c_uint32),
-        ("_pad", ctypes.c_uint8 * 12),
+        ("last_col_250ms", ctypes.c_int32),
+        ("trailing_15m_cnt", ctypes.c_float),
+        ("trailing_15m_q", ctypes.c_float),
+    ]
+
+
+class Bar250ms(ctypes.Structure):
+    _fields_ = [
+        ("bucket_col", ctypes.c_int64),
+        ("bid_ticks", ctypes.c_int32),
+        ("ask_ticks", ctypes.c_int32),
+        ("lit_buy_vol", ctypes.c_double),
+        ("lit_sell_vol", ctypes.c_double),
+        ("cnt_15m", ctypes.c_double),
+        ("q_15m", ctypes.c_double),
+        ("mid_ticks", ctypes.c_double),
+        ("_pad", ctypes.c_uint8 * 8),
+    ]
+
+
+class SymbolRing250ms(ctypes.Structure):
+    _fields_ = [
+        ("seqlock_seq", ctypes.c_uint64),
+        ("open_ns", ctypes.c_int64),
+        ("last_closed_col", ctypes.c_int64),
+        ("first_valid_col", ctypes.c_int64),
+        ("first_valid_bid", ctypes.c_int32),
+        ("first_valid_ask", ctypes.c_int32),
+        ("trailing_15m_cnt", ctypes.c_double),
+        ("trailing_15m_q", ctypes.c_double),
+        ("live_bid_ticks", ctypes.c_int32),
+        ("live_ask_ticks", ctypes.c_int32),
+        ("bars", Bar250ms * MAX_RING_250MS_BARS),
     ]
 
 
@@ -184,6 +219,8 @@ assert ctypes.sizeof(ControlResponse) == 64, f"ControlResponse size mismatch: {c
 assert ctypes.sizeof(SymbolDirectoryEntry) == 16, f"SymbolDirectoryEntry size mismatch: {ctypes.sizeof(SymbolDirectoryEntry)}"
 assert ctypes.sizeof(SymbolSnapshot) == 128, f"SymbolSnapshot size mismatch: {ctypes.sizeof(SymbolSnapshot)}"
 assert ctypes.sizeof(SymbolMicroSnapshot) == 128, f"SymbolMicroSnapshot size mismatch: {ctypes.sizeof(SymbolMicroSnapshot)}"
+assert ctypes.sizeof(Bar250ms) == 64, f"Bar250ms size mismatch: {ctypes.sizeof(Bar250ms)}"
+assert ctypes.sizeof(SymbolRing250ms) == RING_250MS_SYMBOL_SIZE, f"SymbolRing250ms size mismatch: {ctypes.sizeof(SymbolRing250ms)}"
 assert ctypes.sizeof(FrameHeader) == 64, f"FrameHeader size mismatch: {ctypes.sizeof(FrameHeader)}"
 
 # Cache line alignment checks
