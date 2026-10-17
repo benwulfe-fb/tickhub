@@ -461,7 +461,9 @@ func (p *Producer) WaitConsumerAdvance(anchorNS int64, timeout time.Duration) er
 	if atomic.LoadInt64(&p.header.FirstAnchorNS) == 0 {
 		atomic.CompareAndSwapInt64(&p.header.FirstAnchorNS, 0, anchorNS)
 	}
-	p.firstAnchorNS = atomic.LoadInt64(&p.header.FirstAnchorNS)
+	if atomic.LoadInt64(&p.firstAnchorNS) == 0 {
+		atomic.CompareAndSwapInt64(&p.firstAnchorNS, 0, atomic.LoadInt64(&p.header.FirstAnchorNS))
+	}
 
 	start := time.Now()
 	var lastHB int64
